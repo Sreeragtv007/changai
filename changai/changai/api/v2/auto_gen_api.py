@@ -95,7 +95,7 @@ def _get_file_doc_by_name(file_name: str, folder: str = RAG_FOLDER) -> Optional[
         return None
     return frappe.get_doc("File", file_id)
 
-
+@frappe.whitelist(allow_guest=False)
 def _read_filedoctype(file_name: str, folder: str = RAG_FOLDER):
     doc = _get_file_doc_by_name(file_name, folder)
     if not doc:
@@ -300,6 +300,9 @@ def sync_master_data_smart() -> Dict[str, Any]:
     final_data = rebuilt_rows
 
     meta["last_sync"] = str(now_datetime())
+    settings = frappe.get_single("ChangAI Settings")
+    settings.last_masterdata_sync = meta["last_sync"]
+    settings.save(ignore_permissions=True)
     payload_out = {"_meta": meta, "data": final_data}
     file_doc = write_filedoctype(file_name, payload_out, folder=RAG_FOLDER)
 
@@ -740,7 +743,7 @@ def sync_tables_and_schema_smart() -> Dict[str, Any]:
     meta, tables_blocks = _normalize_schema_payload(payload)
 
     by_table = _build_table_map(tables_blocks)
-    last_sync_raw = meta.get("last_doctype_sync")
+    last_sync_raw = meta.get("last_sync")
     changed_doctypes = _get_changed_doctypes(last_sync_raw)
     app_names=["erpnext","frappe"]
     erpnext_modules = get_mod(app_names)
@@ -771,7 +774,11 @@ def sync_tables_and_schema_smart() -> Dict[str, Any]:
         if _strip_tab(table) in valid_doctypes
     }
     _clean_schema_fields(by_table)
-    meta["last_doctype_sync"] = str(now_datetime())
+    meta["last_sync"] = str(now_datetime())
+    settings = frappe.get_single("ChangAI Settings")
+    settings.last_schema_sync = meta["last_sync"]
+    settings.save(ignore_permissions=True)
+
     try:
         _write_schema_outputs(meta, by_table, current_tables)
     except Exception as e:

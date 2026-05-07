@@ -8,6 +8,7 @@ from sqlglot.optimizer.qualify import qualify
 import json
 from typing import Any, Dict, List, Tuple, Union, Optional, Set
 import yaml
+from frappe.utils import getdate
 from pathlib import Path
 
 def _safe_join(base: Path, rel: str) -> Path:
@@ -21,6 +22,7 @@ def _safe_join(base: Path, rel: str) -> Path:
 
 _ALLOWED_EXT = {".json", ".yaml",".j2", ".yml", ".txt", ".md"}
 _ASSETS_DIR = Path(frappe.get_app_path("changai", "changai", "api", "v2", "assets")).resolve()
+_PROMPTS_DIR = Path(frappe.get_app_path("changai", "changai", "prompts")).resolve()
 RAG_FOLDER = "Home/RAG Sources"
 JSON_EXT = ".json"
 YAML_EXT = ".yaml"
@@ -98,22 +100,34 @@ def _load_mapping_data() -> dict:
 @frappe.whitelist()
 def validate_sql_schema(sql: str, dialect: str = "mysql") -> dict:
     try:
-        mapping_data = _load_mapping_data()  # fresh load every time
-        mapping_data = {
-            table: columns
-            for table, columns in mapping_data.items()
-            if table and table.strip() and columns  # skip empty table names AND empty column dicts
-        }
-        schema = MappingSchema(mapping_data, dialect=dialect)
+        mapping_data, schema = get_mapping_schema(dialect)
 
         ast = sqlglot.parse_one(sql, read=dialect)
+        used_tables = {table.name for table in ast.find_all(exp.Table)}
+        small_mapping = {
+            table: mapping_data[table]
+            for table in used_tables
+            if table in mapping_data
+        }
 
         for table in ast.find_all(exp.Table):
             if table.name and table.name not in mapping_data:
-                return {"ok": False, "error": f"Table '{table.name}' does not exist in schema"}
+                return {
+                    "ok": False,
+                    "error": f"Table '{table.name}' does not exist in schema"
+                }
 
-        qualified = optimizer.qualify.qualify(ast, schema=schema, dialect=dialect,identify=False,)
-        return {"ok": True, "qualified_sql": qualified.sql()}
+        qualified = optimizer.qualify.qualify(
+            ast,
+            schema=small_mapping,
+            dialect=dialect,
+            identify=False,
+        )
+
+        return {
+            "ok": True,
+            "qualified_sql": qualified.sql()
+        }
 
     except sqlglot.errors.OptimizeError as e:
         return {"ok": False, "error": str(e)}
@@ -121,22 +135,87 @@ def validate_sql_schema(sql: str, dialect: str = "mysql") -> dict:
         return {"ok": False, "error": str(e)}
 
 from frappe.utils import add_to_date, today, date_diff, days_diff
+MASTER_DOCTYPES = [
+    "Customer",
+    "Supplier",
+    "Item",
+    "Warehouse",
+    "Company",
+    "Account"
+]
 
 @frappe.whitelist(allow_guest=False)
-def checkmaster_updates():
-    file_name = "master_data.yaml"
-    payload = _read_filedoctype(file_name, RAG_FOLDER)
-    if not payload:
-        return {"update": False, "data": False}
-    if not payload.get("data") or not payload.get("_meta"):
-        return {"data": False}
-    meta = payload.get("_meta") or {}
-    lastdate = meta["last_sync"]
-    docs = frappe.get_all("DocType",filters={"modified":[">",lastdate]})
-    if len(docs)>0:
-        return {"update": False,"data":True,"days": days_diff(today(),lastdate)}
-    return {"update": True,"data":True}
+def check_file_updates(file_name=None):
+    settings = frappe.get_single("ChangAI Settings")
 
+    if file_name == "master_data.yaml":
+        last_sync = settings.last_masterdata_sync
+    elif file_name == "schema.yaml":
+        last_sync = settings.last_schema_sync
+    else:
+        frappe.throw("Invalid file_name")
+
+    if not last_sync:
+        return {
+            "update_status": False,
+            "data": True,
+            "days": 0,
+            "last_sync": None
+        }
+
+    if file_name == "schema.yaml":
+        changed = frappe.db.exists(
+            "DocType",
+            {
+                "modified": [">", last_sync]
+            }
+        )
+
+    elif file_name == "master_data.yaml":
+        changed = False
+        for doc in MASTER_DOCTYPES:
+            if frappe.db.exists(doc, {"modified": [">", last_sync]}):
+                changed = True
+                break
+
+    days = days_diff(today(), getdate(last_sync))
+
+    return {
+        "update_status": not bool(changed),
+        "data": True,
+        "days": days,
+        "last_sync": last_sync
+    }
+
+
+@frappe.whitelist()
+def reload_mapping_schema_cache():
+    global _MAPPING_DATA, _MAPPING_SCHEMA
+    _MAPPING_DATA = None
+    _MAPPING_SCHEMA = None
+    get_mapping_schema()
+    return {"ok": True}
+
+
+_MAPPING_DATA = None
+_MAPPING_SCHEMA = None
+
+
+def get_mapping_schema(dialect="mysql"):
+    global _MAPPING_DATA, _MAPPING_SCHEMA
+
+    if _MAPPING_DATA is None:
+        mapping_data = _load_mapping_data()
+        _MAPPING_DATA = {
+            table: columns
+            for table, columns in mapping_data.items()
+            if table and table.strip() and columns
+        }
+
+    if _MAPPING_SCHEMA is None:
+        _MAPPING_SCHEMA = MappingSchema(_MAPPING_DATA, dialect=dialect)
+
+    return _MAPPING_DATA, _MAPPING_SCHEMA
 
 @frappe.whitelist()
 def convert_yaml_schema_to_sqlglot_meta() -> dict:
@@ -171,6 +250,7 @@ def convert_yaml_schema_to_sqlglot_meta() -> dict:
             json.dumps(meta, indent=2),
             encoding="utf-8"
         )
+        reload_mapping_schema_cache()
 
         return {
             "ok": True,
@@ -185,6 +265,6 @@ def convert_yaml_schema_to_sqlglot_meta() -> dict:
 from frappe import _
 @frappe.whitelist(allow_guest=False)
 def test():
-        res=checkmaster_updates()
-        if not res.get("update"):
+        res=check_file_updates("master_data.yaml")
+        if not res.get("update_status"):
             frappe.throw(_("Please update master data for entity recognition to work. Click on Update Master Data button in Training tab in ChangAI Settings.<br>Check Quick Start Guide Here 👇"))
