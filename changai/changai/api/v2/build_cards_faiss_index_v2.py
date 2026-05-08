@@ -11,49 +11,29 @@ from langchain_community.vectorstores import FAISS
 from changai.changai.api.v2.text2sql_pipeline_v2 import get_embedding_engine
 import os
 
-
-def get_base_fvs_dir() -> str:
-    base = frappe.get_site_path("private", "changai", "fvs_stores", "erpnext")
-    base_path = Path(base).resolve()
-    base_path.mkdir(parents=True, exist_ok=True)
-    return str(base_path)
-
-def _get_paths() -> tuple:
-    """Lazily resolve all paths — called only at runtime, never at import."""
-    base = get_base_fvs_dir()
-    return (
-        base,
-        os.path.join(base, "table_fvs"),
-        os.path.join(base, "schema_fvs"),
-        os.path.join(base, "masterdata_fvs"),
-    )
-
-def _get_paths_test() -> tuple:
-    app_base = os.path.join(
+def get_app_fvs_base():
+    return os.path.join(
         frappe.get_app_path("changai"),
-        "changai",
-        "api",
-        "v2",
-        "fvs_stores",
-        "erpnext"
+        "changai", "api", "v2", "fvs_stores", "erpnext"
     )
 
-    private_base = frappe.get_site_path(
-        "private", "changai", "fvs_stores", "erpnext"
-    )
+def get_private_fvs_base():
+    return frappe.get_site_path("private", "changai", "fvs_stores", "erpnext")
+
+
+def _get_fvs_paths() -> tuple:
+    app_base = get_app_fvs_base()
+    private_base = get_private_fvs_base()
 
     table_path = os.path.join(app_base, "table_fvs")
     schema_path = os.path.join(app_base, "schema_fvs")
+    schema_emb_path = os.path.join(app_base, "emb_dir")
     master_path = os.path.join(private_base, "masterdata_fvs")
+
     for p in (app_base, private_base, table_path, schema_path, master_path):
         os.makedirs(p, exist_ok=True)
 
-    return (
-        app_base,
-        table_path,
-        schema_path,
-        master_path,
-    )
+    return app_base, private_base, table_path, schema_path, master_path,schema_emb_path
 
 RAG_FOLDER = "Home/RAG Sources"
 HNSW_M           = 32
@@ -209,6 +189,26 @@ def _build_field_document(table_name: str, module: str, field_row: Dict[str, Any
             options=options,
         ),
     )
+GENERIC_FIELDS = {
+    'creation', 'modified', 'owner', 'parenttype','old_parent',
+    'parentfield', 'parent', 'idx', 'name', 'docstatus'
+}
+@frappe.whitelist(allow_guest=True)
+def clean_schema(schema: Dict[str, Any], output_path: str):
+
+    tables = schema.get("tables", [])
+    for table_block in tables:
+        fields = table_block.get("fields")
+        if isinstance(fields, list):
+            table_block["fields"] = [
+                field for field in fields
+                if field.get("name") not in GENERIC_FIELDS
+            ]
+
+    with open(output_path, "w") as f:
+        yaml.dump(schema, f, allow_unicode=True, sort_keys=False)
+
+    print(f"Cleaned schema written to {output_path}")
 
 
 def build_schema_docs(schema: Dict[str, Any]) -> List[Document]:
@@ -232,8 +232,12 @@ def build_schema_docs(schema: Dict[str, Any]) -> List[Document]:
 
         if not isinstance(fields, list):
             continue
-
+        
         for field_row in fields:
+            field_name = field_row.get("name")
+            if field_name in GENERIC_FIELDS:
+                continue
+                
             doc = _build_field_document(table_name, module, field_row)
             if doc:
                 docs.append(doc)
@@ -303,12 +307,12 @@ def _build_and_save_faiss(
     docs: List[Document],
     out_path: str,
     label: str,
+    base_dir: str,
 ) -> None:
-    """Build a FAISS HNSW index from docs and save to disk."""
     if not docs:
         frappe.throw(f"No documents to index for: {label}")
-    base_fvs, _, _, _ = _get_paths_test()
-    safe_path = _assert_dir_inside_base(out_path, base_fvs)
+
+    safe_path = _assert_dir_inside_base(out_path, base_dir)
     safe_path.mkdir(parents=True, exist_ok=True)
     emb = get_embedding_engine()
 
@@ -359,22 +363,61 @@ def build_all_fvs() -> Dict[str, Any]:
 
 def build_table_fvs_job():
     try:
-        _, table_path, _, _ = _get_paths_test()
+        app_base, _, table_path, _, _,_ = _get_fvs_paths()
         tables_list = _load_json_from_file_doc("tables.json")
         table_docs = build_table_docs(tables_list)
-        _build_and_save_faiss(table_docs, table_path, "ERPNext Table FVS")
+        _build_and_save_faiss(table_docs, table_path, "ERPNext Table FVS", app_base)
         frappe.logger().info(f"ERPNext Table FVS built: {len(table_docs)} docs")
     except Exception :
         frappe.log_error(frappe.get_traceback(), "Build Table FVS Failed")
         raise
 
+import os
+import pickle
+import numpy as np
+def save_field_matrix(schema_docs, base_dir):
+    emb = get_embedding_engine()
+
+    texts = [d.page_content for d in schema_docs]
+    vectors = emb.embed_documents(texts)
+
+    embs = np.array(vectors, dtype="float32")
+    embs = embs / np.clip(
+        np.linalg.norm(embs, axis=1, keepdims=True),
+        1e-12,
+        None
+    )
+
+    table_to_idx = {}
+
+    for i, d in enumerate(schema_docs):
+        meta = getattr(d, "metadata", {}) or {}
+        table = meta.get("table")
+        field = meta.get("field")
+
+        if table and field:
+            table_to_idx.setdefault(table, []).append(i)
+
+    os.makedirs(base_dir, exist_ok=True)
+
+    np.save(os.path.join(base_dir, "field_embs.npy"), embs)
+
+    with open(os.path.join(base_dir, "field_docs.pkl"), "wb") as f:
+        pickle.dump(schema_docs, f)
+
+    with open(os.path.join(base_dir, "table_to_idx.pkl"), "wb") as f:
+        pickle.dump(table_to_idx, f)
+
 
 def build_schema_fvs_job():
     try:
         schema = _load_yaml_from_file_doc("schema.yaml")
+        # schema = clean_schema(schema,schema_path)
         schema_docs = build_schema_docs(schema)
-        _, _, schema_path, _ = _get_paths_test()
-        _build_and_save_faiss(schema_docs, schema_path, "ERPNext Schema FVS")
+        app_base, _, _, schema_path, _,schema_emb_dir = _get_fvs_paths()
+        # clean_schema(schema_path,schema_path)
+        _build_and_save_faiss(schema_docs, schema_path, "ERPNext Schema FVS", app_base)
+        save_field_matrix(schema_docs, schema_emb_dir)
         frappe.logger().info(f"ERPNext Schema FVS built: {len(schema_docs)} docs")
     except Exception :
         frappe.log_error(frappe.get_traceback(), "Build Schema FVS Failed")
@@ -383,10 +426,10 @@ def build_schema_fvs_job():
 
 def build_master_data_fvs_job():
     try:
+        _, private_base, _, _, master_path,_ = _get_fvs_paths()
         master_data = _load_yaml_from_file_doc("master_data.yaml")
         entity_docs = build_entity_docs(master_data)
-        _, _, _, entity_path = _get_paths_test()
-        _build_and_save_faiss(entity_docs, entity_path, "ERPNext Master Data FVS")
+        _build_and_save_faiss(entity_docs, master_path, "ERPNext Master Data FVS", private_base)
         frappe.logger().info(f"ERPNext Master Data FVS built: {len(entity_docs)} docs")
     except Exception :
         frappe.log_error(frappe.get_traceback(), "Build Master Data FVS Failed")

@@ -76,97 +76,88 @@ def get_chat_history(session_id: str) -> list:
         return []
 
     return history[-5:]
-PROMPT_FOLLOWUP = """You are ChangAI, an ERP entity-value detector + query rewriter.
 
-Return ONLY valid JSON with EXACTLY these keys:
-{{"standalone_question":"...","contains_values":true/false}}
-
-### TASK 1 — SPELL CORRECTION:
-- Fix any typos or spelling mistakes in the latest message before doing anything else
-- Examples:
-  - "slaes order of lst mnoth" → "sales order of last month"
-  - "whcih custoemr has pendign" → "which customer has pending"
-  - "stok of chiar item" → "stock of chair item"
-
-### TASK 2 — CONTINUITY DETECTION:
-- Check if the latest message is a follow-up or refers to previous conversation
-- Look at the last 3-4 human messages in chat history for context
-- If it IS a follow-up, rewrite as a fully self-contained standalone question
-- Always put the final rewritten (and corrected) question in "standalone_question"
-
-Follow-up indicators:
-- Pronouns with no clear referent: "it", "they", "that", "those", "him", "her", "his"
-- Incomplete references: "same customer", "that item", "the one", "same period"
-- Continuation words: "also", "and what about", "what else", "show more"
-- Short vague messages: "and today?", "what about last month?", "how many?"
-
-Examples:
-  History: "show sales of ahmed"
-  Latest: "what about his pending invoices"
-  → standalone_question: "show pending invoices of ahmed"
-
-  History: "stock of office chair in main warehouse"
-  Latest: "what about side tabel?"
-  → standalone_question: "stock of side table in main warehouse"
-
-  History: "top 5 customers this month"
-  Latest: "show lst month"
-  → standalone_question: "top 5 customers last month"
-
-  History: "employees in accounts department"
-  Latest: "hw many are absent today?"
-  → standalone_question: "how many employees in accounts department are absent today"
-
-### TASK 3 — ENTITY DETECTION (contains_values):
-Meaning of contains_values (STRICT):
-
-TRUE = standalone_question contains ANY explicit or implied ENTITY IDENTIFIER
-that should be matched to master data
-(customer/supplier/item/warehouse/employee/category etc.)
-
-Examples (TRUE):
-- "invoice of ayan" (name)
-- "who bought laptop last month" (product)
-- "sales of pens today" (product)
-- "top items in electronics category" (category)
-- "stock of office chair in main warehouse" (item + warehouse)
-
-FALSE = NO entity identifier mentioned.
-Only filters, time ranges, counts, ranking words, or statuses.
-
-Examples (FALSE):
-- "show all customers"
-- "unpaid suppliers list"
-- "sales orders pending delivery"
-- "payment received this month"
-- "top vendor dues list"
-- "today sales"
-
-Rules:
-- Any product/item/category reference → contains_values = true
-- Only entity names/codes or product/category references → contains_values = true
-- When unsure between item vs non-item → prefer contains_values = true
-
-### OUTPUT FORMAT (STRICT — no extra keys, no markdown):
-{{"standalone_question":"...","contains_values":true/false}}
-
-Chat history (use ONLY human lines):
-{rows}
-
-Latest user message:
-{qstn}
-"""
 @frappe.whitelist(allow_guest=False)
 def respond_from_cache(user_question:str):
     if user_question:
         doc=frappe.db.get_value("ChangAI Logs",{"user_question":user_question},["sql_generated","result"],as_dict=False)
         return doc
 
+PROMPT_FOLLOWUP = """You are an ERP query rewriter and entity detector.
+Return ONLY valid JSON:
+{{"standalone_question":"...","contains_values":true/false}}
+TASK 1 — FOLLOW-UP
+- If the query depends on previous messages, rewrite it as a complete standalone question.
+- Otherwise keep it unchanged.
+TASK 2 — ENTITY DETECTION
+contains_values = TRUE Any noun that refers to a specific named master record 
+(item name, customer name, supplier name, warehouse name, employee name) 
+if not sure then also contains_values = TRUE otherwise contains_values = FALSE
+Eg:
+TASK 3 — ERP CONTEXTUAL REWRITE
+1. Normalize:
+- Fix typos, clear English
+- Do NOT change entity values
+2.complete intent
+Never change the question's intent — only fix grammar and map ERP terms.
+3. ERP mapping:
+- Map generic terms to standard ERPNext concepts based on intent
+- Avoid vague words if clearer business terms exist
+- Do NOT invent documents or use report names.
+Examples:
+stock → Bin / Stock Ledger Entry
+production → Work Order
+finance/profit → GL Entry
+4. Field hints (max 1–2):
+Use natural phrasing ("based on", "using")
+sales → grand_total
+qty → qty
+stock → actual_qty
+production → produced_qty
+finance → debit / credit
+status → status
+5. Time fields:
+Sales/Stock/Finance → posting_date
+Work Order → actual_start_date / actual_end_date
+Timesheet → start_date / end_date
+Timesheet Detail → from_time / to_time
+- NEVER use posting_date for Timesheet
+- NEVER use creation unless asked
+6. Relationships:
+- Include linked entities if required
+STYLE:
+- Natural business language
+- No SQL, no tab* names
+EXAMPLES:
+"total sales amount last month"
+→ What is the total sales amount from Sales Invoices last month based on grand_total and posting_date?
+"stock in warehouse a"
+→ What is the stock quantity in Warehouse A based on actual_qty from Bin?
+"who worked today"
+→ Which employees logged time today based on Timesheet start_date or Timesheet Detail from_time?
+If the query mentions Draft, Submitted, or Cancelled, explicitly include docstatus in the rewritten question.
+- Do not add a specific document type unless it is clearly implied by the user query or required by standard ERPNext business meaning.
+- For vague money questions, clarify the business meaning as actual, ordered, quoted, paid, or outstanding, but do not guess the document type incorrectly.
+- If the user says "spend", treat it as actual purchase/expense, not quotation or order commitment, unless the user explicitly mentions order, quotation, or planned purchase.
+- Preserve all filter conditions, status values, and keywords from the original question — never drop them during rewriting.
+- Do NOT add dates, filters, entities, statuses, or assumptions unless explicitly present in the user question or clearly inferred from conversation memory.
+Use chat history only when the current query clearly implies continuation or follow-up context. Never assume dates, filters, entities, or conditions from previous messages unless strongly indicated.
+Chat history:
+{rows}
+User:
+{qstn}
+Use only the most relevant tables and fields required for the user query.
+Use only valid tables and fields from the provided schema context, regardless of retrieval ranking order. Choose fields based on business meaning and user intent, not rank position. Never invent schema elements. Always return any one clear user-readable business fields, not only technical IDs, unless explicitly requested. If the query is ambiguous, ask for clarification and set "clarify": true.
+"""
+USER_PROMPT = """Chat History:
+{rows}
 
+User Question:
+{qstn}"""
 @frappe.whitelist(allow_guest=False)
 def inject_prompt(user_qstn: str, session_id: str) -> str:
     rows=get_chat_history(session_id)
-    prompt=PROMPT_FOLLOWUP.format(rows=rows,qstn=user_qstn)
+    prompt=USER_PROMPT.format(rows=rows,qstn=user_qstn)
     return prompt
 
 

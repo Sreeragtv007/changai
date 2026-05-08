@@ -25,34 +25,67 @@ JSON_EXT = ".json"
 SCHEMA_YAML = "schema.yaml"
 YAML_EXT = ".yaml"
 RAG_FOLDER = "Home/RAG Sources"
-erpnext_modules = [
-    "Selling",
-    "Stock",
-    "Buying",
-    "Assets",
-    "Accounts",
-    "CRM",
-    "Projects",
-    "Manufacturing",
-    "Support",
-    "Subcontracting",
-    "Quality Management",
-    "Regional",
-    "Maintenance",
-    "Setup"
-]
 
+def ensure_file_folder(folder_path: str, is_private: int = 1) -> str:
+    """
+    Ensure a File folder path like 'Home/RAG Sources' exists.
+    Returns the full folder path.
+    """
+    if not folder_path:
+        return "Home"
+
+    parts = [p.strip() for p in folder_path.split("/") if p.strip()]
+    if not parts:
+        return "Home"
+
+    current_path = parts[0]
+
+    # Usually Home already exists, but keep this safe.
+    if not frappe.db.exists("File", current_path):
+        frappe.get_doc({
+            "doctype": "File",
+            "file_name": parts[0],
+            "is_folder": 1,
+            "folder": "",
+            "is_private": is_private,
+        }).insert(ignore_permissions=True)
+
+    for part in parts[1:]:
+        next_path = f"{current_path}/{part}"
+        if not frappe.db.exists("File", next_path):
+            frappe.get_doc({
+                "doctype": "File",
+                "file_name": part,
+                "is_folder": 1,
+                "folder": current_path,
+                "is_private": is_private,
+            }).insert(ignore_permissions=True)
+        current_path = next_path
+
+    return current_path
+@frappe.whitelist(allow_guest=False)
+def get_mod(app_names: list[str]):
+    if isinstance(app_names, str):
+        app_names = frappe.parse_json(app_names)
+    return [
+        module 
+        for app in app_names 
+        for module in frappe.get_all("Module Def", filters={"app_name": app}, pluck="name")
+    ]
 SYSTEM_FIELDS = [
     {"fieldname": "name", "fieldtype": "Data", "label": "ID"},
     {"fieldname": "docstatus", "fieldtype": "Int", "label": "Document Status"},
     {"fieldname": "owner", "fieldtype": "Link", "label": "Owner", "options": "User"},
     {"fieldname": "creation", "fieldtype": "Datetime", "label": "Created On"},
     {"fieldname": "modified", "fieldtype": "Datetime", "label": "Last Modified"},
+    {"fieldname": "parent", "fieldtype": "Data", "label": "Parent Document"},
+    {"fieldname": "parenttype", "fieldtype": "Data", "label": "Parent DocType"},
+    {"fieldname": "parentfield", "fieldtype": "Data", "label": "Parent Field"},
+    {"fieldname": "idx", "fieldtype": "Int", "label": "Row Index"},
 ]
-
 EXCLUDED_FIELDTYPES: Set[str] = {
     "Section Break", "Column Break", "Tab Break", "Page Break", "Table Break",
-    "Fold", "Heading", "HTML", "Button", "Attach Image", "Image", "Signature", "Icon",
+    "Fold", "Heading", "HTML", "Button", "Attach Image", "Image", "Signature", "Icon","Table"
 }
 
 
@@ -62,7 +95,7 @@ def _get_file_doc_by_name(file_name: str, folder: str = RAG_FOLDER) -> Optional[
         return None
     return frappe.get_doc("File", file_id)
 
-
+@frappe.whitelist(allow_guest=False)
 def _read_filedoctype(file_name: str, folder: str = RAG_FOLDER):
     doc = _get_file_doc_by_name(file_name, folder)
     if not doc:
@@ -80,19 +113,18 @@ def _read_filedoctype(file_name: str, folder: str = RAG_FOLDER):
         obj = yaml.safe_load(raw) or {}
         return obj if isinstance(obj, dict) else {}
     return raw
-
 def write_filedoctype(
     file_name: str,
-    payload,
+    payload: Any,
     folder: str = "Home/RAG Sources",
     is_private: int = 1
 ):
+    folder = ensure_file_folder(folder, is_private=is_private)
+
     if file_name.endswith(JSON_EXT):
         text = json.dumps(payload, ensure_ascii=False, indent=2)
-
     elif file_name.endswith((YAML_EXT, ".yml")):
         text = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
-
     else:
         text = str(payload)
 
@@ -106,20 +138,21 @@ def write_filedoctype(
 
     if existing:
         doc = frappe.get_doc("File", existing)
-        frappe.logger().info(f"Overwriting {file_name} → file_url={doc.file_url}")
+        frappe.logger().info(f"Overwriting {file_name} -> file_url={doc.file_url}")
         doc.save_file(content=content, overwrite=True)
         doc.save(ignore_permissions=True)
         doc.reload()
         return doc
-    else:
-        doc = frappe.get_doc({
-            "doctype": "File",
-            "file_name": file_name,
-            "folder": folder,
-            "is_private": is_private,
-            "content": content,
-        }).insert(ignore_permissions=True)
-        return doc
+
+    doc = frappe.get_doc({
+        "doctype": "File",
+        "file_name": file_name,
+        "folder": folder,
+        "is_private": is_private,
+        "content": content,
+    }).insert(ignore_permissions=True)
+
+    return doc
 def _tab(dt: str) -> str:
     dt = (dt or "").strip()
     return f"tab{dt}"
@@ -133,11 +166,15 @@ MODULES_TO_SYNC = ["Customer", "Item", "Currency", "Supplier"]
 
 
 def _normalize_master_data_payload(payload: Any) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not isinstance(payload, dict):
+        payload = {}
+
     meta = payload.get("_meta") or {}
     data = payload.get("data") or []
 
     if not isinstance(meta, dict):
         meta = {}
+
     if not isinstance(data, list):
         data = []
 
@@ -215,6 +252,7 @@ def update_masterdata():
         "message":"Master Data update running in RQ Job"
     }
 
+
 def sync_master_data_smart() -> Dict[str, Any]:
     file_name = "master_data.yaml"
     payload = _read_filedoctype(file_name, RAG_FOLDER)
@@ -262,6 +300,9 @@ def sync_master_data_smart() -> Dict[str, Any]:
     final_data = rebuilt_rows
 
     meta["last_sync"] = str(now_datetime())
+    settings = frappe.get_single("ChangAI Settings")
+    settings.last_masterdata_sync = meta["last_sync"]
+    settings.save(ignore_permissions=True)
     payload_out = {"_meta": meta, "data": final_data}
     file_doc = write_filedoctype(file_name, payload_out, folder=RAG_FOLDER)
 
@@ -281,7 +322,6 @@ def sync_master_data_smart() -> Dict[str, Any]:
         "fvs_error": None,
     }
 
-
 def _clean_schema_fields(by_table: Dict[str, Dict[str, Any]]) -> None:
     for block in by_table.values():
         for field in block.get("fields", []) or []:
@@ -293,7 +333,8 @@ def _clean_schema_fields(by_table: Dict[str, Dict[str, Any]]) -> None:
 
             if field.get("fieldtype") != "Link":
                 field.pop("join_hint", None)
-            return "ok"
+
+
 @frappe.whitelist(allow_guest=True)
 def test():
     payload = _read_filedoctype("schema.yaml", "Home/RAG Sources")
@@ -359,6 +400,8 @@ def test():
 
 @frappe.whitelist(allow_guest=False)
 def get_doctypes_changed_since(last_sync: Optional[str]) -> List[str]:
+    app_names=["erpnext","frappe"]
+    erpnext_modules = get_mod(app_names)
     filters = {
     "module": ["in", erpnext_modules],
     "issingle": 0,
@@ -476,12 +519,12 @@ def _build_fields_from_meta(
     fields: List[Dict[str, Any]] = []
     added_fieldnames = set()
 
-    # always add system fields first
-    for sys_field in SYSTEM_FIELDS:
-        field_entry = _build_field_entry(sys_field, existing_fields, meta_dt.name)
-        if field_entry:
-            fields.append(field_entry)
-            added_fieldnames.add(field_entry["name"])
+    # # always add system fields first
+    # for sys_field in SYSTEM_FIELDS:
+    #     field_entry = _build_field_entry(sys_field, existing_fields, meta_dt.name)
+    #     if field_entry:
+    #         fields.append(field_entry)
+    #         added_fieldnames.add(field_entry["name"])
 
     # then add real doctype fields
     for field_meta in meta_dt.fields:
@@ -683,15 +726,27 @@ def fill_missing_field_descriptions(
 
 
 
+# def clear_schema_field_caches() -> None:
+#     """
+#     Call this when schema_fvs is rebuilt/refreshed.
+#     """
+#     global _TABLE_FIELD_DOCS_CACHE, _TABLE_FIELD_VS_CACHE, _FULL_FIELDS_VS
+#     with _TABLE_FIELD_CACHE_LOCK:
+#         _TABLE_FIELD_DOCS_CACHE = None
+#         _TABLE_FIELD_VS_CACHE = OrderedDict()
+#         _FULL_FIELDS_VS = None
+
+
 @frappe.whitelist(allow_guest=False)
 def sync_tables_and_schema_smart() -> Dict[str, Any]:
     payload = _read_filedoctype(SCHEMA_YAML, RAG_FOLDER)
     meta, tables_blocks = _normalize_schema_payload(payload)
 
     by_table = _build_table_map(tables_blocks)
-    last_sync_raw = meta.get("last_doctype_sync")
+    last_sync_raw = meta.get("last_sync")
     changed_doctypes = _get_changed_doctypes(last_sync_raw)
-
+    app_names=["erpnext","frappe"]
+    erpnext_modules = get_mod(app_names)
     current_doctypes = frappe.get_all(
     "DocType",
     filters={
@@ -706,7 +761,7 @@ def sync_tables_and_schema_smart() -> Dict[str, Any]:
     changed_tables = {_tab(dt) for dt in changed_doctypes}
     missing_from_schema = {t for t in current_tables if t not in by_table}
 
-    tables_to_process = sorted(changed_tables | missing_from_schema)
+    tables_to_process =current_tables
 
     for table in tables_to_process:
         _process_schema_table(table, by_table)
@@ -719,7 +774,11 @@ def sync_tables_and_schema_smart() -> Dict[str, Any]:
         if _strip_tab(table) in valid_doctypes
     }
     _clean_schema_fields(by_table)
-    meta["last_doctype_sync"] = str(now_datetime())
+    meta["last_sync"] = str(now_datetime())
+    settings = frappe.get_single("ChangAI Settings")
+    settings.last_schema_sync = meta["last_sync"]
+    settings.save(ignore_permissions=True)
+
     try:
         _write_schema_outputs(meta, by_table, current_tables)
     except Exception as e:
@@ -736,7 +795,6 @@ def sync_tables_and_schema_smart() -> Dict[str, Any]:
     }
 
 
-@frappe.whitelist(allow_guest=False)
 def _get_claude_client() -> Optional[Anthropic]:
     
     settings = frappe.get_single("ChangAI Settings")
@@ -1006,6 +1064,7 @@ def sync_schema_and_enqueue_descriptions() -> Dict[str, Any]:
         queue="long",
         timeout=1800,
     )
+    # clear_schema_field_caches()
     return {"ok": True, "message": _("Schema updated ✅ Field descriptions running in background 🧠")}
 
 

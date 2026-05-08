@@ -8,25 +8,98 @@
     <div v-if="message.role !== 'user'" class="flex min-w-0 max-w-[calc(100%-2.5rem)] flex-1 flex-col max-[600px]:max-w-[calc(100%-2.25rem)]">
       <div
         v-if="isLoadingStatus"
-        class="chat-card inline-flex min-h-9.5 min-w-16 items-center justify-center gap-2 rounded-[10px_10px_10px_3px] px-4 py-3"
-        role="status"
-        aria-live="polite"
-        :aria-label="loaderLabel"
+        class="flex w-fit flex-col items-start gap-1"
       >
-        <span class="h-2 w-2 animate-dot-wave rounded-full bg-brand-500 [animation-delay:0ms]"></span>
-        <span class="h-2 w-2 animate-dot-wave rounded-full bg-brand-500 [animation-delay:200ms]"></span>
-        <span class="h-2 w-2 animate-dot-wave rounded-full bg-brand-500 [animation-delay:400ms]"></span>
+        <div
+          class="chat-card inline-flex w-fit rounded-[10px_10px_10px_3px] px-3 py-2"
+          role="status"
+          aria-live="polite"
+          :aria-label="loaderLabel"
+        >
+          <div class="inline-flex items-center gap-1.5">
+            <span class="relative inline-flex h-4 w-4 shrink-0 items-center justify-center">
+              <span class="absolute inset-0 rounded-full border border-transparent border-t-[#4b89ff] border-r-[#4b89ff]/70 animate-gemini-arc"></span>
+              <svg viewBox="0 0 24 24" class="relative h-3 w-3 text-[#4b89ff] animate-gemini-spark" aria-hidden="true">
+                <path fill="currentColor" d="M12 2.8c.52 3.22 1.6 5.66 3.22 7.28 1.62 1.62 4.06 2.7 7.28 3.22-3.22.52-5.66 1.6-7.28 3.22-1.62 1.62-2.7 4.06-3.22 7.28-.52-3.22-1.6-5.66-3.22-7.28-1.62-1.62-4.06-2.7-7.28-3.22 3.22-.52 5.66-1.6 7.28-3.22 1.62-1.62 2.7-4.06 3.22-7.28Z"/>
+              </svg>
+            </span>
+            <span class="text-[8px] font-semibold tracking-[0.12em] uppercase text-[#3a67c9]">{{ loaderLabel }}</span>
+          </div>
+        </div>
       </div>
       <div
         v-else
-        class="chat-card w-fit max-w-full overflow-x-auto whitespace-pre-line rounded-[10px_10px_10px_3px] px-4 py-3 text-xs leading-relaxed wrap-anywhere text-slate-900"
-        v-html="message.text"
-      ></div>
+        class="flex w-fit max-w-full flex-col items-start gap-2"
+      >
+        <div
+          class="chat-card relative w-fit max-w-full whitespace-pre-line rounded-[10px_10px_10px_3px] px-4 py-3 text-xs leading-relaxed wrap-anywhere text-slate-900"
+        >
+          <div
+            class="overflow-x-auto"
+            :class="shouldCollapse && !isExpanded ? 'max-h-48 overflow-y-hidden' : ''"
+            v-html="message.text"
+          ></div>
+          <div
+            v-if="shouldCollapse && !isExpanded"
+            class="pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[10px] bg-linear-to-t from-white via-white/92 to-white/0"
+            aria-hidden="true"
+          ></div>
+        </div>
+
+        <div
+          v-if="shouldCollapse"
+          class="flex flex-wrap items-center gap-2"
+        >
+          <button
+            type="button"
+            class="inline-flex items-center rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-600 transition-colors duration-200 hover:border-brand-200 hover:text-brand-600"
+            :title="isExpanded ? 'Collapse response' : 'Expand response'"
+            :aria-label="isExpanded ? 'Collapse response' : 'Expand response'"
+            @click="isExpanded = !isExpanded"
+          >
+            {{ isExpanded ? 'Collapse' : 'Expand' }}
+          </button>
+        </div>
+
+        <div
+          v-if="showMuteButton"
+          class="flex flex-wrap items-center"
+        >
+          <button
+            type="button"
+            class="inline-flex h-8 w-8 items-center justify-center rounded-full border transition-colors duration-200"
+            :class="isMuted ? 'border-red-200 bg-red-50 text-red-600 hover:border-red-300 hover:bg-red-100' : 'border-green-200 bg-green-50 text-green-600 hover:border-green-300 hover:bg-green-100'"
+            :title="isMuted ? 'Unmute voice playback' : 'Mute voice playback'"
+            :aria-label="isMuted ? 'Unmute voice playback' : 'Mute voice playback'"
+            @click="toggleMute"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              aria-hidden="true"
+            >
+              <path d="M11 5L6 9H3v6h3l5 4V5Z" />
+              <template v-if="isMuted">
+                <path d="M15 9l4 6" />
+                <path d="M19 9l-4 6" />
+              </template>
+              <template v-else>
+                <path d="M15 10a3 3 0 0 1 0 4" />
+                <path d="M17.5 7.5a6 6 0 0 1 0 9" />
+              </template>
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
 
     <p
       v-else
-      class="w-fit max-w-[85%] whitespace-pre-line rounded-[13px_13px_3px_13px] bg-gradient-to-br from-brand-500 to-brand-600 px-4 py-3 text-[11px] leading-relaxed wrap-anywhere text-white shadow-[0_14px_30px_-18px_rgba(109,79,194,0.85)] max-[600px]:max-w-[88%]"
+      class="w-fit max-w-[85%] whitespace-pre-line rounded-[13px_13px_3px_13px] bg-linear-to-br from-brand-500 to-brand-600 px-4 py-3 text-[11px] leading-relaxed wrap-anywhere text-white shadow-[0_14px_30px_-18px_rgba(109,79,194,0.85)] max-[600px]:max-w-[88%]"
     >
       {{ message.text }}
     </p>
@@ -60,6 +133,8 @@ const props = defineProps({
 
 const isSpeaking = ref(false)
 const currentAudio = ref(null)
+const isExpanded = ref(false)
+const isMuted = ref(false)
 
 const speechSupported = computed(() => (
   typeof window !== 'undefined' &&
@@ -93,6 +168,27 @@ function stopSpeech() {
     currentAudio.value = null
   }
   isSpeaking.value = false
+}
+
+function toggleMute() {
+  isMuted.value = !isMuted.value
+  if (isMuted.value) {
+    stopSpeech()
+  } else {
+    // Resume TTS with the current message text when unmuting
+    const speakable = normalizedMessageText.value
+    if (!props.autoReadEnabled || !props.ttsConfig?.enableVoiceChat) return
+    if (!speakable || isPlaceholderStatus()) return
+
+    if (props.ttsConfig?.pollyAvailable && props.ttsConfig?.usePolly) {
+      speakTextWithPolly(speakable).catch((err) => {
+        console.warn('Polly TTS failed, falling back to browser speech:', err)
+        speakText(speakable)
+      })
+      return
+    }
+    speakText(speakable)
+  }
 }
 
 function speakText(text) {
@@ -157,21 +253,37 @@ async function speakTextWithPolly(text) {
 }
 
 function handleGlobalStop() {
-  isSpeaking.value = false
+  stopSpeech()
 }
 
-function isPlaceholderStatus(text) {
-  return text === 'Thinking...' || text === 'Sending to support...'
+function isPlaceholderStatus() {
+  return Boolean(props.message?.isStatus)
 }
 
 const normalizedMessageText = computed(() => getSpeakableText(props.message?.text || ''))
 
 const isLoadingStatus = computed(() => (
-  props.message?.role !== 'user' && isPlaceholderStatus(normalizedMessageText.value)
+  props.message?.role !== 'user' && isPlaceholderStatus()
 ))
 
-const loaderLabel = computed(() => (
-  normalizedMessageText.value === 'Sending to support...' ? 'Sending to support' : 'Thinking'
+const loaderLabel = computed(() => {
+  if (!props.message?.isStatus) return ''
+  if (props.message.statusType === 'support') return 'Sending to support'
+  return normalizedMessageText.value || 'Thinking'
+})
+
+const shouldCollapse = computed(() => {
+  if (props.message?.role === 'user' || isLoadingStatus.value) return false
+
+  const plainText = normalizedMessageText.value
+  const lineCount = plainText.split(/\n+/).filter(Boolean).length
+  return plainText.length > 520 || lineCount > 8
+})
+
+const showMuteButton = computed(() => (
+  props.message?.role !== 'user' &&
+  !isLoadingStatus.value &&
+  props.ttsConfig?.enableVoiceChat
 ))
 
 watch(
@@ -179,13 +291,14 @@ watch(
   async (newText, oldText) => {
     if (!props.autoReadEnabled) return
     if (props.message.role === 'user') return
+    if (isMuted.value) return
     if (!props.ttsConfig?.enableVoiceChat) {
       emitTtsProvider('off')
       return
     }
 
     const speakable = getSpeakableText(newText)
-    if (!speakable || isPlaceholderStatus(speakable)) return
+    if (!speakable || isPlaceholderStatus()) return
 
     const oldSpeakable = getSpeakableText(oldText || '')
     if (speakable === oldSpeakable) return
@@ -200,6 +313,14 @@ watch(
     }
 
     speakText(speakable)
+  },
+)
+
+watch(
+  () => props.message.text,
+  () => {
+    isExpanded.value = false
+    isMuted.value = false
   },
 )
 

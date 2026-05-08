@@ -5,21 +5,24 @@ from typing import Any, Dict, List, Tuple, Union, Optional, Set
 import boto3
 import requests
 import json
+from changai.changai.api.v2.non_erp_handler import handle_non_erp_query
 import yaml
 import re
 import os
 import time
 import base64
 import sqlglot
+from functools import lru_cache
 from sqlglot import exp
-from langsmith.run_helpers import traceable
+from rapidfuzz import fuzz, process
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from google import genai
 from google.genai import types
-from changai.changai.api.v2.schema_utils import validate_sql_schema,_load_mapping_data
+from changai.changai.api.v2.schema_utils import validate_sql_schema,_load_mapping_data,check_file_updates
 from google.oauth2 import service_account
+
 from werkzeug.wrappers import Response
 from changai.changai.api.v2.helpdesk_api import(
     create_helpdesk_ticket,
@@ -37,11 +40,150 @@ from frappe.desk.reportview import build_match_conditions
 import shutil
 from frappe import _
 from pathlib import Path
-
+import numpy as np
+from typing import List, Dict, Any
+from symspellpy.symspellpy import SymSpell
+sym_spell = None
+_GEMINI_CLIENT = None
+_GEMINI_CONFIG = None
+_FIELD_DOCS_CACHE = None
+_FIELD_EMBS_CACHE = None
+_TABLE_TO_IDX_CACHE = None
+_KEYWORDS_SET=None
+_KEYWORDS_LIST=None
 _ASSETS_DIR = Path(frappe.get_app_path("changai", "changai", "api", "v2", "assets")).resolve()
 _PROMPTS_DIR = Path(frappe.get_app_path("changai", "changai", "prompts")).resolve()
 CHANGAI_SETTINGS = "ChangAI Settings"
 _ALLOWED_EXT = {".json", ".yaml",".j2", ".yml", ".txt", ".md"}
+
+import frappe
+from typing import Any, Dict, Optional
+
+SQL_REWRITE_PROMPT = """You are an ERP query rewriter and entity detector.
+Return ONLY valid JSON:
+{{"standalone_question":"...","contains_values":true/false}}
+
+TASK 1 — FOLLOW-UP
+- If the query depends on previous messages, rewrite it as a complete standalone question.
+- Otherwise keep it unchanged.
+
+TASK 2 — ENTITY DETECTION
+contains_values = TRUE: Any noun that refers to a specific named master record
+(item name, customer name, supplier name, warehouse name, employee name)
+If not sure, also set contains_values = TRUE, otherwise contains_values = FALSE.
+
+TASK 3 — ERP CONTEXTUAL REWRITE
+
+1. Normalize:
+- Fix typos, clear English
+- Do NOT change entity values
+
+2. Complete intent:
+- Never change the question's intent — only fix grammar and map ERP terms.
+
+3. ERP mapping:
+- Map generic terms to standard ERPNext concepts based on intent
+- Avoid vague words if clearer business terms exist
+- Do NOT invent documents or use report names.
+Examples:
+  stock       → Bin / Stock Ledger Entry
+  production  → Work Order
+  finance/profit → GL Entry
+
+4. Field hints (max 1–2):
+Use natural phrasing ("based on", "using"):
+  sales       → grand_total
+  qty         → qty
+  stock       → actual_qty
+  production  → produced_qty
+  finance     → debit / credit
+  status      → status
+
+5. Time fields:
+  Sales/Stock/Finance → posting_date
+  Work Order          → actual_start_date / actual_end_date
+  Timesheet           → start_date / end_date
+  Timesheet Detail    → from_time / to_time
+- NEVER use posting_date for Timesheet
+- NEVER use creation unless asked
+
+6. Relationships:
+- Include linked entities if required
+
+STYLE:
+- Natural business language
+- No SQL, no tab* names
+
+EXAMPLES:
+"total sales amount last month"
+→ What is the total sales amount from Sales Invoices last month based on grand_total and posting_date?
+
+"stock in warehouse a"
+→ What is the stock quantity in Warehouse A based on actual_qty from Bin?
+
+"who worked today"
+→ Which employees logged time today based on Timesheet start_date or Timesheet Detail from_time?
+
+STRICT RULES:
+- If the query mentions Draft, Submitted, or Cancelled, explicitly include docstatus in the rewritten question.
+- Do not add a specific document type unless clearly implied by the user query or required by standard ERPNext business meaning.
+- For vague money questions, clarify the business meaning as actual, ordered, quoted, paid, or outstanding — do not guess the document type incorrectly.
+- If the user says "spend", treat it as actual purchase/expense, not quotation or order commitment, unless the user explicitly mentions order, quotation, or planned purchase.
+- Preserve all filter conditions, status values, and keywords from the original question — never drop them during rewriting.
+- Do NOT add dates, filters, entities, statuses, or assumptions unless explicitly present in the user question or clearly inferred from conversation memory.
+- Use chat history only when the current query clearly implies continuation or follow-up context. Never assume dates, filters, entities, or conditions from previous messages unless strongly indicated.
+- Use only the most relevant tables and fields required for the user query.
+- Use only valid tables and fields from the provided schema context, regardless of retrieval ranking order.
+- Choose fields based on business meaning and user intent, not rank position.
+- Never invent schema elements.
+- Always return any one clear user-readable business field, not only technical IDs, unless explicitly requested.
+- If the query is ambiguous, ask for clarification and set "clarify": true."""
+def get_symspell():
+    global sym_spell
+
+    if sym_spell is not None:
+        frappe.logger().info(f"SymSpell already loaded, skipping PID: {os.getpid()}")
+        return sym_spell
+
+    frappe.logger().error(f"SymSpell loading NOW in PID: {os.getpid()}") 
+
+    sym_spell = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
+
+    dictionary_path = frappe.get_app_path(
+        "changai",
+        "utils",
+        "dictionaries",
+        "frequency_dictionary_en_82_765.txt"
+    )
+
+    sym_spell.load_dictionary(dictionary_path, term_index=0, count_index=1)
+
+    for kw in BUSINESS_KEYWORDS:
+        sym_spell.create_dictionary_entry(kw.lower(), 1000)
+
+    return sym_spell
+
+
+def publish_pipeline_update(request_id, stage, message, data=None, done=False, error=False):
+    if not request_id:
+        return
+    payload = {
+        "request_id": request_id,
+        "stage": stage,
+        "message": message,
+        "data": data or {},
+        "done": done,
+        "error": error,
+        "timestamp": frappe.utils.now_datetime().isoformat(),
+    }
+    frappe.publish_realtime(
+        event=f"debug_{request_id}",
+        message=payload,
+        user=frappe.session.user,
+    )
+# @frappe.whitelist(allow_guest=False)
+# def test():
+#     return publish_pipeline_update("session_1775182859529_ecd7cd87-cec1-42f4-be0d-c969b48a5117_1775182993037", "test_stage", "Test realtime working")
 
 def _safe_join(base: Path, rel: str) -> Path:
     """
@@ -49,7 +191,8 @@ def _safe_join(base: Path, rel: str) -> Path:
     """
     p = (base / rel).resolve()
     if base != p and base not in p.parents:
-        frappe.throw(_("Unsafe path: {0}").format(rel))
+        frappe.throw(_("Unsafe path: {0}\n"
+                       "Check Quick Start Guide Here 👇:\n {1}").format(rel,CHANGAI_GUIDE_LINK))
     return p
 
 
@@ -61,11 +204,13 @@ def read_asset(file_name: str, base: str = "assets") -> Any:
     """
     file_name = (file_name or "").strip()
     if not file_name:
-        frappe.throw(_("file_name is required"))
+        frappe.throw(_("file_name is required\n"
+                       "Check Quick Start Guide Here 👇:\n {0}").format(CHANGAI_GUIDE_LINK))
 
     ext = Path(file_name).suffix.lower()
     if ext not in _ALLOWED_EXT:
-        frappe.throw(_("Unsupported file type: {0}").format(ext))
+        frappe.throw(_("Unsupported file type: {0}\n"
+                       "Check Quick Start Guide Here 👇:\n {1}").format(ext, CHANGAI_GUIDE_LINK))
 
     if base == "assets":
         root = _ASSETS_DIR
@@ -74,12 +219,14 @@ def read_asset(file_name: str, base: str = "assets") -> Any:
     else:
         root = None
     if root is None:
-        frappe.throw(_("Invalid base: {0}").format(base))
+        frappe.throw(_("Invalid base: {0}\n"
+                       "Check Quick Start Guide Here 👇:\n {1}").format(base, CHANGAI_GUIDE_LINK))
 
     path = _safe_join(root, file_name)
 
     if not path.is_file():
-        frappe.throw(_("File not found: {0}").format(str(path)))
+        frappe.throw(_("File not found: {0}\n"
+                       "Check Quick Start Guide Here 👇:\n {1}").format(str(path), CHANGAI_GUIDE_LINK))
 
     content = path.read_text(encoding="utf-8", errors="replace")
 
@@ -87,40 +234,45 @@ def read_asset(file_name: str, base: str = "assets") -> Any:
         try:
             return json.loads(content)
         except json.JSONDecodeError as e:
-            frappe.throw(_("Invalid JSON in {0}: {1}").format(str(path), str(e)))
+            frappe.throw(_("Invalid JSON in {0}: {1}"
+                           "Check Quick Start Guide Here 👇:\n {2}").format(str(path), str(e), CHANGAI_GUIDE_LINK))
     if ext == ".yaml" or ext == ".yml":
         try:
             return yaml.safe_load(content)
         except yaml.YAMLError as e:
-            frappe.throw(_("Invalid YAML in {0}: {1}").format(str(path), str(e)))
+            frappe.throw(_("Invalid YAML in {0}: {1}"
+                           "Check Quick Start Guide Here 👇:\n {2}").format(str(path), str(e), CHANGAI_GUIDE_LINK))
     return content
 
 _VS_TABLE = None
 _VS_MASTER = None
 _EMBEDDER_INSTANCE = None
-__vector_store = None
 _FULL_FIELDS_VS = None
 STATUS_200 = 200
 _SUB_VS_CACHE = {}
 APPLICATION_JSON = "application/json"
-EMBEDDING_ENGINE_NONE_MESSG = "Embedding engine is None. Model not loaded."
+CHANGAI_GUIDE_LINK="https://app.erpgulf.com/en/articles/chang-ai-quick-start-guide"
+EMBEDDING_ENGINE_NONE_MESSG = f"""
+Embedding engine is None. Model not loaded.
+Check Quick Start Guide Here 👇:
+{CHANGAI_GUIDE_LINK}"""
 MODEL_ID = "gemini-2.5-flash-lite"
 RETRY_LIMIT = 2
-BACKEND_SERVER_SETTINGS = "Backend Server Settings"
 bk = read_asset("business_keywords_v1.json", base="assets")
 BUSINESS_KEYWORDS = bk.get("business_keywords", bk)
 
 mapping_data = read_asset("metaschema_clean_v2.json", base="assets")
 CONVERSATION_TEMPLATE = read_asset("conversation_template_v2.j2", base="assets")
-
-SQL_PROMPT = read_asset("sql_prompt.txt", base="prompts")
+SQL_SYS_PROMPT = read_asset("sql_system_prompt.txt", base="prompts")
+SQL_PROMPT = read_asset("sql_user_prompt.txt", base="prompts")
 FORMAT_PROMPT = read_asset("user_friendly_prompt.txt", base="prompts")
 NON_ERP_PROMPT = read_asset("non_erp_prompt.txt", base="prompts")
 SUPPORT_PROMPT = read_asset("support.txt", base="prompts")
+SUPPORT_USER_PROMPT = read_asset("support_user_prompt.txt", base="prompts")
+SUPPORT_SYS_PROMPT = read_asset("support_sys_prompt.txt", base="prompts")
 
 FILTER_TABLES = read_asset("filter_tables.txt", base="prompts")
 filter_fields = read_asset("filter_fields.txt", base="prompts")
-
 
 @frappe.whitelist(allow_guest=False)
 def download_model():
@@ -154,7 +306,15 @@ def download_model_from_ui():
 
         snapshot_download(
             repo_id="hyrinmansoor/changAI-nomic-embed-text-v1.5-finetuned",
-            local_dir=model_path
+            local_dir=model_path,
+            ignore_patterns=[
+        "*.pt",
+        "*.pth",
+        "*.bin",
+        "trainer_*",
+        "optimizer*"
+    ]
+
         )
 
         _EMBEDDER_INSTANCE = None
@@ -162,7 +322,49 @@ def download_model_from_ui():
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Embedding Model Download Failed")
-        frappe.throw(f"Model download failed: {str(e)}")
+        frappe.throw(_("Model download failed: {0}\n Check Quick Start Guide Here 👇:\n{1}").format(str(e),CHANGAI_GUIDE_LINK))
+
+import os
+import pickle
+import numpy as np
+
+_FIELD_DOCS_CACHE = None
+_FIELD_EMBS_CACHE = None
+_TABLE_TO_IDX_CACHE = None
+
+
+def load_field_matrix():
+    global _FIELD_DOCS_CACHE, _FIELD_EMBS_CACHE, _TABLE_TO_IDX_CACHE
+
+    if _FIELD_DOCS_CACHE is not None:
+        return _FIELD_DOCS_CACHE, _FIELD_EMBS_CACHE, _TABLE_TO_IDX_CACHE
+
+    app_root = frappe.get_app_path("changai")
+    schema_path = os.path.join(
+        app_root,
+        "changai", "api", "v2", "fvs_stores", "erpnext", "emb_dir"
+    )
+
+    embs_path = os.path.join(schema_path, "field_embs.npy")
+    docs_path = os.path.join(schema_path, "field_docs.pkl")
+    table_idx_path = os.path.join(schema_path, "table_to_idx.pkl")
+
+    if not os.path.exists(embs_path):
+        frappe.throw(f"Missing field_embs.npy. Rebuild schema FVS first: {embs_path}")
+
+    with open(docs_path, "rb") as f:
+        docs = pickle.load(f)
+
+    with open(table_idx_path, "rb") as f:
+        table_to_idx = pickle.load(f)
+
+    embs = np.load(embs_path, mmap_mode="r")
+
+    _FIELD_DOCS_CACHE = docs
+    _FIELD_EMBS_CACHE = embs
+    _TABLE_TO_IDX_CACHE = table_to_idx
+
+    return docs, embs, table_to_idx
 
 
 def get_embedding_engine():
@@ -175,16 +377,19 @@ def get_embedding_engine():
         frappe.throw(
             _(
                 "Go to <b>ChangAI Settings</b> and click <b>'Download Embedding Model'</b>.<br><br>"
-                "Watch this documentation tutorial for more detail: "
-                "<a href='{0}' target='_blank'>Click here to watch</a>"
-            ).format("https://your-docs-url-here.com"),
+                "Check this Quick Start Guide for more detail: "
+                "<a href='{0}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>"
+            ).format(CHANGAI_GUIDE_LINK),
             title=_("Embedding Model Required")
         )
     
     if _EMBEDDER_INSTANCE is None:
         _EMBEDDER_INSTANCE = HuggingFaceEmbeddings(
             model_name=model_path,
-            model_kwargs={"device": "cpu"}
+            model_kwargs={"device": "cpu","trust_remote_code": True,},
+            encode_kwargs={
+        "normalize_embeddings": True,
+    },
         )
     
     return _EMBEDDER_INSTANCE
@@ -257,20 +462,29 @@ class ChangAIConfig:
             frappe.clear_document_cache(CHANGAI_SETTINGS)
             frappe.local._changai_config = get_settings()
         return frappe.local._changai_config
+_POLLY_CLIENT = None
 
+def get_polly_client(config):
+    global _POLLY_CLIENT
+
+    if _POLLY_CLIENT is None:
+        _POLLY_CLIENT = boto3.client(
+            "polly",
+            aws_access_key_id=(config.get("aws_access_key_id") or "").strip(),
+            aws_secret_access_key=(config.get("aws_secret_access_key") or "").strip(),
+            region_name=(config.get("aws_region") or "us-east-1"),
+        )
+    return _POLLY_CLIENT
 
 @frappe.whitelist(allow_guest=False)
 def synthesize_tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
     config = ChangAIConfig.get()
-
     if not bool(config.get("enable_voice_chat")):
         return {"ok": False, "error": "Voice chat is disabled in settings.", "provider": "browser"}
-
     aws_access_key_id = (config.get("aws_access_key_id") or "").strip()
     aws_secret_access_key = (config.get("aws_secret_access_key") or "").strip()
     if not aws_access_key_id or not aws_secret_access_key:
         return {"ok": False, "error": "AWS Polly credentials are missing.", "provider": "browser"}
-
     cleaned_text = re.sub(r"<[^>]*>", " ", text or "")
     cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
     if not cleaned_text:
@@ -280,12 +494,7 @@ def synthesize_tts(text: str, voice_id: Optional[str] = None) -> Dict[str, Any]:
         cleaned_text = cleaned_text[:2500]
 
     try:
-        polly_client = boto3.client(
-            "polly",
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=(config.get("aws_region") or "us-east-1"),
-        )
+        polly_client = get_polly_client(config)
         voice = (voice_id or config.get("polly_voice_id") or "Joanna").strip() or "Joanna"
         response = polly_client.synthesize_speech(
             Text=cleaned_text,
@@ -391,7 +600,8 @@ def whoami() -> Dict[str, Any]:
             mimetype=APPLICATION_JSON,
         )
     except ValueError as ve:
-        frappe.throw(ve)
+        frappe.throw(_("{0}\n Check Quick Start Guide Here 👇:\n {1}").format(ve,CHANGAI_GUIDE_LINK))
+                     
 
 
 def extract_tables_from_sql(sql: str) -> List[str]:
@@ -408,13 +618,13 @@ def extract_tables_from_sql(sql: str) -> List[str]:
     return tables
 
 
-def call_model(prompt: str, task: str = "llm") -> Any:
+def call_model(prompt: str, task: str = "llm",sys_prompt: str = "") -> Any:
     config = ChangAIConfig.get()
     if config["REMOTE"] and config["llm"] == "QWEN3":
         return remote_llm_request_deploy_test(prompt=prompt, task=task)
     else:
         if config["llm"] == "Gemini":
-            return call_gemini(prompt)
+            return call_gemini(prompt,sys_prompt)
 
 
 def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = 120):
@@ -455,17 +665,20 @@ def _get_gemini_vertex_config(config):
 def _throw_missing_vertex_field(project_id: str, location: str, credentials_json: str) -> None:
     if not project_id:
         frappe.throw(
-            _("Gemini Project ID is missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Gemini Project ID</b>."),
+            _("Gemini Project ID is missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Gemini Project ID</b>.<br>"
+              "Check Quick Start Guide 👇:<br><a href='{0}' target='_blank'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Missing Gemini Project ID"),
         )
     if not location:
         frappe.throw(
-            _("Gemini Location is missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Gemini Location</b>."),
+            _("Gemini Location is missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Gemini Location</b>.<br>"
+              "Check Quick Start Guide 👇:<br><a href='{0}' target='_blank'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Missing Gemini Location"),
         )
     if not credentials_json:
         frappe.throw(
-            _("Service Account Credentials are missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Service Account Credential</b>."),
+            _("Service Account Credentials are missing.<br><br>Please go to <b>ChangAI Settings</b> and enter your <b>Service Account Credential</b>.<br>"
+              "Check Quick Start Guide 👇:<br><a href='{0}' target='_blank'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Missing Service Account Credentials"),
         )
 
@@ -503,8 +716,9 @@ def _get_api_key_client(config):
                 "<a href='https://aistudio.google.com/app/apikey' target='_blank'>Google AI Studio</a>.<br><br>"
                 "<b>Option 2 (Vertex AI / Service Account):</b><br>"
                 "Fill in <b>Gemini Project ID</b>, <b>Gemini Location</b>, "
-                "and <b>Service Account Credentials</b> in <b>ChangAI Settings</b>."
-            ),
+                "and <b>Service Account Credentials</b> in <b>ChangAI Settings</b>.<br>"
+                "ChangAI Quick Start Guide 👇:<br><a href='{0}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>"
+            ).format(CHANGAI_GUIDE_LINK),
             title=_("Gemini Authentication Not Configured"),
         )
 
@@ -539,41 +753,53 @@ def _clean_gemini_response_text(text: str) -> str:
 def _handle_gemini_api_exception(e: Exception) -> None:
     if isinstance(e, google_exceptions.ResourceExhausted):
         frappe.throw(
-            _("Gemini API quota exceeded.<br><br>Please wait and try again or upgrade your plan."),
+            _("Gemini API quota exceeded.<br><br>Please wait and try again or upgrade your plan.<br>Check Quick Start Guide 👇:<br>"
+              "<a href='{0}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Gemini Quota Exceeded"),
         )
     if isinstance(e, google_exceptions.Unauthenticated):
         frappe.throw(
-            _("Gemini API key is invalid.<br><br>Please go to <b>ChangAI Settings</b> and enter a valid <b>Gemini API Key</b>."),
+            _("Gemini API key is invalid.<br><br>Please go to <b>ChangAI Settings</b> and enter a valid <b>Gemini API Key</b>.<br>"
+              "Check ChangAI Quick Start Guide 👇:<br><a href='{0}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Invalid Gemini API Key"),
         )
     if isinstance(e, google_exceptions.PermissionDenied):
         frappe.throw(
-            _("Gemini API permission denied.<br><br>Please check your API key permissions."),
+            _("Gemini API permission denied.<br><br>Please check your API key permissions.<br>"
+              "Check ChangAI Quick Start Guide 👇:<br><a href='{0}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>").format(CHANGAI_GUIDE_LINK),
             title=_("Gemini Permission Denied"),
         )
     if isinstance(e, google_exceptions.InvalidArgument):
         frappe.throw(
-            _("Invalid request to Gemini API: {0}").format(str(e)),
+            _("Invalid request to Gemini API: {0}<br>"
+              "Check ChangAI Quick Start Guide 👇:<br>"
+              "<a href='{1}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>").format(str(e),CHANGAI_GUIDE_LINK),
             title=_("Gemini Invalid Request"),
         )
 
     frappe.log_error(frappe.get_traceback(), "Gemini API Unexpected Error")
     frappe.throw(
-        _("Gemini API error: {0}").format(str(e)),
+        _("Gemini API error: {0}<br>"
+          "Check ChangAI Quick Start Guide 👇:<br>"
+          "<a href='{1}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>").format(str(e),CHANGAI_GUIDE_LINK),
         title=_("Gemini API Error"),
     )
 
-
-def call_gemini(prompt: str) -> Union[str, Dict[str, Any]]:
-    try:
-        frappe.clear_document_cache(CHANGAI_SETTINGS)
+def gemini_client():
+    global _GEMINI_CLIENT,_GEMINI_CONFIG
+    if _GEMINI_CLIENT is None:
         config = frappe.get_single(CHANGAI_SETTINGS)
+        _GEMINI_CONFIG =  config
+        _GEMINI_CLIENT = _build_gemini_client(config)
+    return _GEMINI_CLIENT
 
-        client = _build_gemini_client(config)
+def call_gemini(prompt: str,sys_prompt: str) -> Union[str, Dict[str, Any]]:
+    try:
+        # frappe.clear_document_cache(CHANGAI_SETTINGS)
+        client = gemini_client()
 
         gemini_config = types.GenerateContentConfig(
-            system_instruction="You are an ERPNext assistant. Follow the task instructions exactly."
+            system_instruction=sys_prompt,
         )
         response = client.models.generate_content(
             model=MODEL_ID,
@@ -668,6 +894,7 @@ def _safe_strip(v):
 
 # Shared State
 class SQLState(TypedDict, total=False):
+    request_id: str
     session_id: str
     question: str
     contains_values: bool
@@ -692,35 +919,55 @@ class SQLState(TypedDict, total=False):
     selected_fields: str
 
 
+def is_erp_query(q: str) -> tuple[bool, str]:
+    _init_keywords()
+    for word in q.lower().split():
+        is_erp = _word_is_erp(word)
+        if is_erp:
+            return True
+    return False
+
+def correct_spelling(text: str) -> str:
+    sym = get_symspell()
+    suggestions = sym.lookup_compound(text, max_edit_distance=2)
+    return suggestions[0].term if suggestions else text
+
+
 def fill_sql_prompt(question: str, context: str) -> str:
     return SQL_PROMPT.format(question=question, context=context)
 
 
 def guardrail_router(state: SQLState) -> SQLState:
+    request_id = state.get("request_id")
+
     raw_q = state.get("formatted_q") or state.get("question") or ""
     q = str(raw_q).lower().strip()
+    q_corrected = correct_spelling(q)
+    is_erp= is_erp_query(q_corrected)
+    query_type = "ERP" if is_erp else "NON_ERP"
 
-    safe_keywords: List[str] = []
-    for kw in BUSINESS_KEYWORDS:
-        try:
-            safe_keywords.append(str(kw).lower())
-        except Exception:
-            continue
+    state["query_type"] = query_type
+    publish_pipeline_update(
+            request_id,
+            "question_rewrite_done",
+            "Query classified as " + query_type,
+            data={"query_type": query_type}
+        )
 
-    is_erp = any(kw in q for kw in safe_keywords)
-    return {**state, "query_type": "ERP" if is_erp else "NON_ERP"}
 
+    return state
 
 def send_non_erp_request(state: SQLState) -> SQLState:
-    qstn = state.get("formatted_q") or state.get("question")
+    qstn =state.get("question")
     if not qstn:
         return {**state, "non_erp_res": "", "error": "No question provided"}
-    prompt = NON_ERP_PROMPT.format(question=qstn)
+    # prompt = NON_ERP_PROMPT.format(question=qstn)
     try:
-        response = call_model(prompt, "llm")
-        if not response or isinstance(response, dict):
-            return {**state, "prompt": prompt, "non_erp_res": "", "error": str(response)}
-        return {**state, "prompt": prompt, "non_erp_res": response, "error": None}
+        response = handle_non_erp_query(qstn)
+        # response = call_model(prompt, "llm")
+        if not response or not response.get("data"):
+            return {**state,"non_erp_res": "", "error": str(response)}
+        return {**state,"non_erp_res": response["data"], "error": None}
     except frappe.exceptions.ValidationError:
         raise
     except Exception as e:
@@ -750,15 +997,26 @@ def _parse_rewrite_response(raw: Any, user_qstn: str) -> Tuple[str, bool]:
 
     return standalone or user_qstn.strip(), contains_values
 
-
-@traceable(name="rewrite_question", run_type="tool")
+SQL_REWRITE_SYS_PROMPT = read_asset("sql_rewrite_sys_prompt.txt", base="prompts")
+SQL_REWRITE_USER_PROMPT = read_asset("sql_rewrite_user_prompt.txt", base="prompts")
 def rewrite_question(state: SQLState) -> SQLState:
+    request_id = state.get("request_id")
     user_qstn = state.get("question") or ""
     session_id = state.get("session_id")
+    sys_prompt = SQL_REWRITE_SYS_PROMPT
     prompt = inject_prompt(user_qstn, session_id)
+
     try:
-        raw = call_model(prompt, "llm")
+        raw = call_model(prompt, "llm",sys_prompt)
         standalone, contains_values = _parse_rewrite_response(raw, user_qstn)
+
+        publish_pipeline_update(
+            request_id,
+            "question_rewrite_done",
+            "Question rewritten",
+            data={"formatted_q": standalone}
+        )
+
         return {
             **state,
             "formatted_q": standalone,
@@ -766,16 +1024,16 @@ def rewrite_question(state: SQLState) -> SQLState:
             "formatting_prompt": prompt,
             "error": None,
         }
-    except frappe.exceptions.ValidationError:
-        raise
+
     except Exception as e:
-        return {
-            **state,
-            "error": str(e),
-            "formatted_q": "",
-            "contains_values": False,
-            "formatting_prompt": prompt,
-        }
+        publish_pipeline_update(
+            request_id,
+            "failed",
+            str(e),
+            error=True,
+            done=True
+        )
+        return {**state, "error": str(e)}
 
 def get_table_vs():
     global _VS_TABLE
@@ -799,7 +1057,8 @@ def get_table_vs():
         )
 
         if not os.path.exists(table_vs_path):
-            frappe.throw(_("FAISS table store not found at {0}").format(table_vs_path))
+            frappe.throw(_("FAISS table store not found at {0}\n"
+            "Check Quick Start Guide Here 👇:\n {1}").format(table_vs_path,CHANGAI_GUIDE_LINK))
 
         _VS_TABLE = FAISS.load_local(
             table_vs_path,
@@ -823,7 +1082,8 @@ def get_table_vs_test():
         )
 
         if not os.path.exists(table_vs_path):
-            frappe.throw(_("FAISS table store not found at {0}").format(table_vs_path))
+            frappe.throw(_("FAISS table store not found at {0} <br>"
+            f"Check Quick Start Guide Here 👇:\n {1}").format(table_vs_path,CHANGAI_GUIDE_LINK))
 
         _VS_TABLE = FAISS.load_local(
             table_vs_path,
@@ -835,7 +1095,7 @@ def get_table_vs_test():
 
 
 def call_fvs_table_search(q: str) -> List[str]:
-    hits = get_table_vs().similarity_search(q, k=15)
+    hits = get_table_vs().similarity_search(q, k=20)
     out, seen = [], set()
     for h in hits:
         t = h.metadata.get("table")
@@ -853,35 +1113,61 @@ def _parse_json_list(raw: str) -> List[Any]:
         return []
 
 
-def call_retrieve_multi_line(user_question: str) -> Dict[str, Any]:
+from langchain_community.vectorstores import FAISS
+import faiss
+
+def build_hnsw_index(embeddings):
+    dim = len(embeddings[0])
+    
+    index = faiss.IndexHNSWFlat(dim, 32)  # 32 = neighbors (tune this)
+    index.hnsw.efConstruction = 200       # build quality
+    index.hnsw.efSearch = 50              # search accuracy/speed tradeoff
+    
+    return index
+
+
+@frappe.whitelist(allow_guest=True)
+def call_retrieve_multi_line(user_question: str, request_id: str) -> Dict[str, Any]:
     try:
+        # publish_pipeline_update(
+        #     request_id,
+        #     "table_retrieval",
+        #     "Searching relevant tables"
+        # )
         top_tables = call_fvs_table_search(user_question)
-        table_prompt = FILTER_TABLES.replace("{user_question}", user_question)
-        table_prompt = table_prompt.replace("{table_list}", json.dumps(top_tables, ensure_ascii=False))
-        selected_raw = call_gemini(table_prompt)
-        selected_tables = _parse_json_list(selected_raw)
-        top_set = set(top_tables)
-        selected_tables = [t for t in selected_tables if t in top_set]
-        if not selected_tables:
-            return {"selected_fields": {}, "selected_tables": [], "top_tables": top_tables}
-        fields_candidates = {}
-        for table in selected_tables:
-            fields_candidates[table] = call_fvs_field_search(
-                user_question,
-                table_name=table,
-                selected_tables=selected_tables,
-                k=40
-            )
-        field_prompt = filter_fields.replace("{user_question}", user_question)
-        field_prompt = field_prompt.replace("{fields_tables}", json.dumps(fields_candidates, ensure_ascii=False))
-        selected_raw = call_gemini(field_prompt)
-        try:
-            selected_map = json.loads(selected_raw) if isinstance(selected_raw, str) else {}
-        except Exception:
-            selected_map = {}
+        publish_pipeline_update(
+            request_id,
+            "table_retrieval_done",
+            "Tables retrieved"
+        )
+        # table_prompt = FILTER_TABLES.replace("{user_question}", user_question)
+        # table_prompt = table_prompt.replace("{table_list}", json.dumps(top_tables, ensure_ascii=False))
+        # selected_raw = call_gemini(table_prompt)
+        # selected_tables = _parse_json_list(selected_raw)
+        # top_set = set(top_tables)
+        # selected_tables = [t for t in selected_tables if t in top_set]
+        # if not selected_tables:
+        #     return {"selected_fields": {}, "selected_tables": [], "top_tables": top_tables}
+        fields_candidates= call_fvs_field_search_global_k(
+            user_question,
+            selected_tables=top_tables,
+            k_total=40
+        )
+        publish_pipeline_update(
+            request_id,
+            "field_retrieval_done",
+            "Fields selected"
+        )
+        # field_prompt = filter_fields.replace("{user_question}", user_question)
+        # field_prompt = field_prompt.replace("{fields_tables}", json.dumps(fields_candidates, ensure_ascii=False))
+        # selected_raw = call_gemini(field_prompt)
+        # try:
+        #     selected_map = json.loads(selected_raw) if isinstance(selected_raw, str) else {}
+        # except Exception:
+        #     selected_map = {}
         return {
-            "selected_fields": json.dumps(selected_map, ensure_ascii=False),
-            "selected_tables": selected_tables,
+            "selected_fields": fields_candidates,
+            "selected_tables": top_tables,
             "top_tables": top_tables,
             "top_fields": fields_candidates,
         }
@@ -889,6 +1175,150 @@ def call_retrieve_multi_line(user_question: str) -> Dict[str, Any]:
         raise
     except Exception as e:
         return {"selected_fields": {}, "selected_tables": [], "top_tables": [], "error": str(e)}
+
+
+def call_fvs_field_search_global_k(
+    user_question: str,
+    selected_tables: List[str],
+    k_total: int = 20,
+) -> str:
+
+    if not user_question or not selected_tables:
+        return ""
+
+    docs, embs, table_to_idx = load_field_matrix()
+
+    import numpy as np
+
+    emb = get_embedding_engine()
+
+    q_vec = np.array(
+        emb.embed_query(user_question),
+        dtype="float32"
+    )
+
+    q_vec = q_vec / max(np.linalg.norm(q_vec), 1e-12)
+
+    # collect indices
+    all_idxs = []
+    for t in selected_tables:
+        all_idxs.extend(table_to_idx.get(t, []))
+
+    if not all_idxs:
+        return ""
+
+    sub_embs = embs[all_idxs]
+    scores = sub_embs @ q_vec
+
+    top_global = np.argsort(-scores)[:k_total]
+
+    grouped = {}
+    seen = set()
+
+    for i in top_global:
+        doc_i = all_idxs[int(i)]
+        d = docs[doc_i]
+
+        meta = getattr(d, "metadata", {}) or {}
+        table = meta.get("table")
+        field = meta.get("field")
+
+        if not table or not field:
+            continue
+
+        key = (table, field)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        name = field
+
+        # join hint
+        if meta.get("join_hint"):
+            linked_table = meta["join_hint"].get("table")
+            if linked_table:
+                name += f" -> {linked_table}"
+
+        # options
+        if meta.get("options"):
+            opts = meta["options"]
+            if isinstance(opts, list):
+                name += " {" + ", ".join(map(str, opts[:5])) + "}"
+
+        grouped.setdefault(table, []).append(name)
+
+    # 🔥 final compact string
+    parts = []
+    for table, fields in grouped.items():
+        parts.append(f"{table}: " + ", ".join(fields))
+
+    return "\n".join(parts)
+
+
+def call_fvs_field_search_grouped(
+    user_question: str,
+    selected_tables: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+
+    if not user_question or not selected_tables:
+        return {}
+
+    sub_vs = get_sub_vs(selected_tables)
+    if sub_vs is None:
+        return {}
+
+    hits = sub_vs.similarity_search(user_question, k=20)
+
+    selected_set = set(selected_tables)
+    grouped = {}
+    seen = set()
+
+    for d in hits:
+        meta = getattr(d, "metadata", {}) or {}
+        tbl = meta.get("table")
+        fld = meta.get("field")
+        key = (tbl, fld)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = {"field": fld, "table": tbl}
+
+        join_hint = meta.get("join_hint")
+        if join_hint:
+            row["join_hint"] = join_hint
+
+        options = meta.get("options")
+        if options:
+            row["options"] = options
+
+        grouped.setdefault(tbl, []).append(row)
+
+    return grouped
+
+def get_full_fields_vs_test():
+    global _FULL_FIELDS_VS
+
+    if _FULL_FIELDS_VS is None:
+        emb = get_embedding_engine()
+        if emb is None:
+            frappe.throw(_(EMBEDDING_ENGINE_NONE_MESSG))
+
+        full_fields_vs_path = frappe.get_site_path(
+            "private", "changai", "fvs_stores", "erpnext", "schema_fvs"
+        )
+
+        if not os.path.isdir(full_fields_vs_path):
+            frappe.throw(_("Vector store path not found: {0}"
+            "Check Quick Start Guide Here 👇:\n {1}").format(full_fields_vs_path, CHANGAI_GUIDE_LINK))
+
+        _FULL_FIELDS_VS = FAISS.load_local(
+            full_fields_vs_path,
+            emb,
+            allow_dangerous_deserialization=True
+        )
+
+    return _FULL_FIELDS_VS
+
 
 
 def get_full_fields_vs():
@@ -905,7 +1335,8 @@ def get_full_fields_vs():
         )
 
         if not os.path.isdir(full_fields_vs_path):
-            frappe.throw(_("Vector store path not found: {0}").format(full_fields_vs_path))
+            frappe.throw(_("Vector store path not found: {0} <br>"
+            "Check Quick Start Guide Here 👇:\n {1}").format(full_fields_vs_path,CHANGAI_GUIDE_LINK))
 
         _FULL_FIELDS_VS = FAISS.load_local(
             full_fields_vs_path,
@@ -914,31 +1345,6 @@ def get_full_fields_vs():
         )
 
     return _FULL_FIELDS_VS
-
-
-def get_full_fields_vs_test():
-    global _FULL_FIELDS_VS
-
-    if _FULL_FIELDS_VS is None:
-        emb = get_embedding_engine()
-        if emb is None:
-            frappe.throw(_(EMBEDDING_ENGINE_NONE_MESSG))
-
-        full_fields_vs_path = frappe.get_site_path(
-            "private", "changai", "fvs_stores", "erpnext", "schema_fvs"
-        )
-
-        if not os.path.isdir(full_fields_vs_path):
-            frappe.throw(_("Vector store path not found: {0}").format(full_fields_vs_path))
-
-        _FULL_FIELDS_VS = FAISS.load_local(
-            full_fields_vs_path,
-            emb,
-            allow_dangerous_deserialization=True
-        )
-
-    return _FULL_FIELDS_VS
-
 
 def get_sub_vs(selected_tables: List[str]) -> Optional[FAISS]:
     """Build sub-index ONCE per unique selected_tables set (cached)."""
@@ -965,46 +1371,47 @@ def get_sub_vs(selected_tables: List[str]) -> Optional[FAISS]:
     return sub
 
 
-def call_fvs_field_search(
-    user_question: str,
-    table_name: str,
-    selected_tables: List[str],
-    k: int = 40,
-) -> List[Dict[str, Any]]:
-    if not user_question or not table_name:
-        return []
-    sub_vs = get_sub_vs(selected_tables)
-    if sub_vs is None:
-        return []
-    hits = sub_vs.similarity_search(user_question, k=min(60, max(40, k)))
-    results: List[Dict[str, Any]] = []
-    seen = set()
-    for d in hits:
-        meta = getattr(d, "metadata", {}) or {}
-        tbl = meta.get("table")
-        fld = meta.get("field")
-        if tbl != table_name:
-            continue
-        key = (tbl, fld)
-        if key in seen:
-            continue
-        seen.add(key)
-        row = {
-            "field": fld,
-        }
-        if meta.get("join_hint"):
-            row["join_hint"] = meta.get("join_hint")
-        if meta.get("options"):
-            row["options"] = meta.get("options")
+# def call_fvs_field_search(
+#     user_question: str,
+#     table_name: str,
+#     selected_tables: List[str],
+#     k: int = 40,
+# ) -> List[Dict[str, Any]]:
+#     if not user_question or not table_name:
+#         return []
+#     sub_vs = get_sub_vs(selected_tables)
+#     if sub_vs is None:
+#         return []
+#     # hits = sub_vs.similarity_search(user_question, k=min(60, max(40, k)))
+#     hits = sub_vs.similarity_search(user_question, k=20)
 
-        results.append(row)
-        if len(results) >= k:
-            break
-    return results
+#     results: List[Dict[str, Any]] = []
+#     seen = set()
+#     for d in hits:
+#         meta = getattr(d, "metadata", {}) or {}
+#         tbl = meta.get("table")
+#         fld = meta.get("field")
+#         if tbl != table_name:
+#             continue
+#         key = (tbl, fld)
+#         if key in seen:
+#             continue
+#         seen.add(key)
+#         row = {
+#             "field": fld,"table":tbl
+#         }
+#         if meta.get("join_hint"):
+#             row["join_hint"] = meta.get("join_hint")
+#         if meta.get("options"):
+#             row["options"] = meta.get("options")
+
+#         results.append(row)
+#         if len(results) >= k:
+#             break
+#     return results
 
 
 # Node 1: Retrive with Fiass Vector Store.
-@traceable(name="schema_retriever", run_type="tool")
 def schema_retriever(state: SQLState) -> SQLState:
     config = ChangAIConfig.get()
     try:
@@ -1012,7 +1419,7 @@ def schema_retriever(state: SQLState) -> SQLState:
             hits = remote_embedder_request(state.get("formatted_q", "") or state.get("question", ""))
             return {**state, "hits": hits}
         else:
-            out = call_retrieve_multi_line(state.get("formatted_q") or state.get("question") or "")
+            out = call_retrieve_multi_line(state.get("formatted_q") or state.get("question") or "",state.get("request_id"),)
             return {
                 **state,
                 "retrieval_mode": "multi",
@@ -1028,7 +1435,6 @@ def schema_retriever(state: SQLState) -> SQLState:
 
 
 # # Node 2: Build schema context from hits - for SQL Prompt
-@traceable(name="hits_to_prompt_context", run_type="tool")
 def hits_to_prompt_context(state:SQLState) -> SQLState:
     ctx=hits_to_schema_context(state["hits"],title="SCHEMA CONTEXT",max_fields_per_table=25)
     entity_context=state.get("entity_cards", [])
@@ -1045,8 +1451,8 @@ def hits_to_prompt_context(state:SQLState) -> SQLState:
 
 
 # # Node 3:Generate the SQL Prompt and call LLM(Ollama Http)
-@traceable(name="generate_sql", run_type="tool")
 def generate_sql(state:SQLState) -> SQLState:
+    request_id = state.get("request_id")
     selected_fields = state.get("selected_fields") or ""
     entity_cards = state.get("entity_cards") or []
     entity_block = ""
@@ -1062,13 +1468,18 @@ def generate_sql(state:SQLState) -> SQLState:
     else:
         prompt=fill_sql_prompt(formatted_q,state["context"])
     try:
-        response=call_model(prompt)
+        response=call_model(prompt,"llm",SQL_SYS_PROMPT)
         if not response:
             return {**state, "error": "Empty response from LLM", "sql_prompt": prompt}
         if isinstance(response, str):
             response = json.loads(response)
         sql = response.get("sql", "")
         orm = response.get("orm", "")
+        publish_pipeline_update(
+            request_id,
+            "sql_generated",
+            "SQL generated"
+        )
         return {**state,"sql_prompt":prompt,"sql":sql,"orm":orm,"error":None}
     except frappe.exceptions.ValidationError:
         raise
@@ -1077,7 +1488,6 @@ def generate_sql(state:SQLState) -> SQLState:
 
 
 # # Node 4:Validate the SQL Generate with meta schema mapping using SQLGlot
-@traceable(name="validate_sql", run_type="tool")
 def validate_sql(state: SQLState) -> SQLState:
     sql = clean_sql(state.get("sql") or "")
     if not sql:
@@ -1125,7 +1535,9 @@ def remote_entity_embedder(q: str) -> Union[list, str]:
 #         _VS_MASTER = FAISS.load_local(master_vs_path, emb, allow_dangerous_deserialization=True)
 #     return _VS_MASTER
 
-
+settingsUrl = frappe.utils.get_url(
+    "/app/changai-settings/ChangAI%20Settings"
+)
 @frappe.whitelist(allow_guest=False)
 def get_master_vs():
     global _VS_MASTER
@@ -1138,9 +1550,19 @@ def get_master_vs():
         master_vs_path = frappe.get_site_path(
             "private", "changai", "fvs_stores", "erpnext", "masterdata_fvs"
         )
-
         if not os.path.exists(master_vs_path):
-            frappe.throw(_("FAISS MASTER store not found at {0}.Please click on Update Master Data button in Training tab in ChangAI Settings").format(master_vs_path))
+            frappe.throw(_(
+                "FAISS MASTER store not found at {0}.<br><br>"
+                "Please open "
+                "<a href='{1}' target='_blank' rel='noopener noreferrer'>ChangAI Settings</a> "
+                "and click on the <b>Update Master Data</b> button in the Training tab.<br><br>"
+                "Check Quick Start Guide Here 👇<br>"
+                "<a href='{2}' target='_blank' rel='noopener noreferrer' style='color:#1e90ff;'>Click here</a>"
+            ).format(
+                master_vs_path,
+                settingsUrl,
+                CHANGAI_GUIDE_LINK
+            ))
 
         _VS_MASTER = FAISS.load_local(
             master_vs_path,
@@ -1152,7 +1574,7 @@ def get_master_vs():
 
 @frappe.whitelist()
 def local_entity_embedder(q: str) -> List[Dict[str, Any]]:
-    hits = get_master_vs().similarity_search(q, k=4)
+    hits = get_master_vs().similarity_search(q, k=10)
     out, seen = [], set()
     for h in hits:
         entity_type = h.metadata.get("entity_type")
@@ -1188,7 +1610,6 @@ def call_entity_retriever(qstn: str) -> Dict[str, Any]:
 
 
 # # Node 5:Repair Loop :Simple prompt for one more try.
-@traceable(name="repair_sqlquery", run_type="tool")
 def repair_sqlquery(state: SQLState) -> SQLState:
     hints: List[str] = []
     tries = int(state.get("tries") or 0) + 1
@@ -1206,10 +1627,10 @@ def repair_sqlquery(state: SQLState) -> SQLState:
     sql_prompt = state.get("sql_prompt")
     if not sql_prompt:
         return {**state, "tries": tries, "error": "No SQL prompt to repair from"}
-    patched_prompt = sql_prompt + "\n\n#VALIDATION HINTS\n" + "\n".join(f"-{h}" for h in hints)
+    patched_prompt =sql_prompt + "\n\n#VALIDATION HINTS\n" + "\n".join(f"-{h}" for h in hints)
 
     try:
-        response = call_model(patched_prompt,"llm")
+        response = call_model(patched_prompt,"llm",SQL_SYS_PROMPT)
         if isinstance(response, str):
             try:
                 response = json.loads(response)
@@ -1227,22 +1648,46 @@ def repair_sqlquery(state: SQLState) -> SQLState:
         return {**state, "tries": tries, "error": f"Repair call failed {e}"}
 
 
-@traceable(name="detect_specific_entities", run_type="tool")
 def detect_specific_entities(state: SQLState) -> SQLState:
     if not state.get("contains_values"):
         return {**state, "entity_cards": [], "entity_raw": None}
-
+    
     q = (state.get("formatted_q") or "").strip()
     if not q:
         return {**state, "entity_cards": [], "entity_raw": None}
 
     try:
+        res = check_file_updates("master_data.yaml")
+
+        if not res.get("data"):
+            frappe.throw(_(
+                "Master Data does not exist. Because of this, results may not be accurate. "
+                "For better accuracy, please open "
+                "<a href='{0}' target='_blank' rel='noopener noreferrer'>ChangAI Settings</a> "
+                "and click on the <b>Update Master Data</b> button in the Training tab.<br><br>"
+                "Check Quick Start Guide Here 👇:<br>"
+                "<a href='{1}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>"
+            ).format(settingsUrl, CHANGAI_GUIDE_LINK))
+
+        if not res.get("update_status") and res.get("days", 0) > 0:
+            frappe.throw(_(
+                "Your master data is {0} days old. "
+                "Because of this, results may not be accurate. "
+                "For better accuracy, please open "
+                "<a href='{1}' target='_blank' rel='noopener noreferrer'>ChangAI Settings</a> "
+                "and click on the <b>Update Master Data</b> button in the Training tab.<br><br>"
+                "Check Quick Start Guide Here 👇:<br>"
+                "<a href='{2}' target='_blank' rel='noopener noreferrer' style='color: #1e90ff;'>Click here</a>"
+            ).format(res.get("days"), settingsUrl, CHANGAI_GUIDE_LINK))
+
         out = call_entity_retriever(q)
         return {
             **state,
             "entity_cards": out.get("cards") or [],
             "entity_raw": out.get("raw"),
         }
+    except frappe.exceptions.ValidationError:
+        raise
     except Exception as e:
         frappe.log_error(f"Entity retriever failed: {e}", "ChangAI Entity Gate")
         return {**state, "entity_cards": [], "entity_raw": {"error": str(e)}}
@@ -1285,7 +1730,6 @@ def clean_sql(s: Any) -> str:
 
 
 # # Router to decide next stage:
-@traceable(name="router", run_type="tool")
 def router(state:SQLState) -> str:
     if state.get("error"):
         return "end"
@@ -1434,6 +1878,7 @@ def validate_sql_against_mapping(
 
 
 
+
 # Building the Workflow Graph
 workflow=StateGraph(SQLState)
 workflow.add_node("rewrite_question",rewrite_question)
@@ -1445,10 +1890,11 @@ workflow.add_node("generate_sql",generate_sql)
 workflow.add_node("validate_sql",validate_sql)
 workflow.add_node("repair_sql",repair_sqlquery)
 workflow.add_node("send_non_erp_request",send_non_erp_request)
-workflow.set_entry_point("rewrite_question")
-workflow.add_edge("rewrite_question", "guardrail_router")
-workflow.add_conditional_edges("guardrail_router",route_guardrail,{"ERP":"retrieve","NON_ERP":"send_non_erp_request"})
+workflow.set_entry_point("guardrail_router")
+workflow.add_conditional_edges("guardrail_router",route_guardrail,{"ERP":"rewrite_question","NON_ERP":"send_non_erp_request"})
+# workflow.add_edge("guardrail_router", "rewrite_question")
 workflow.add_edge("send_non_erp_request", END)
+workflow.add_edge("rewrite_question", "retrieve")
 workflow.add_edge("retrieve","detect_entities")
 workflow.add_conditional_edges("detect_entities", route_after_entities, {"CONTEXT":"build_context","DIRECT":"generate_sql"})
 workflow.add_edge("build_context", "generate_sql")
@@ -1479,21 +1925,22 @@ def execute_query(sql: str, doctypes: List[str]) -> Any:
         if not sql:
             return []
         if not str(sql).lower().strip().startswith("select"):
-            frappe.throw(_("Only SELECT queries are allowed."))
+            frappe.throw(_("Only SELECT queries are allowed."
+                           "Check Quick Start Guide Here 👇:\n {0}").format(CHANGAI_GUIDE_LINK))
         combined = _build_match_conditions(doctypes)
         if combined:
             sql = _append_conditions(sql, combined)
         return frappe.db.sql(sql, as_dict=True)
     except Exception as e:
-        return {"error": f"SQL Execution Failed: {e}"}
+        return {"error": f"SQL Execution Failed: {e}\n Check Quick Start Guide Here 👇:\n {CHANGAI_GUIDE_LINK}"}
 
 
 @frappe.whitelist(allow_guest=False)
 def support_bot(message: str) -> Dict[str, Any]:
     user_email = frappe.session.user
     full_name = frappe.get_value("User", frappe.session.user, "full_name")
-    prompt = SUPPORT_PROMPT.format(user_message=message)
-    raw = call_gemini(prompt)
+    prompt = SUPPORT_USER_PROMPT.format(user_message=message)
+    raw = call_gemini(prompt, SUPPORT_SYS_PROMPT)
     output = json.loads(raw)
     task_flag = (output.get("task_flag") or "UNKNOWN").strip()
     ticket_id = output.get("ticket_id")
@@ -1574,24 +2021,24 @@ def format_data(qstn: str, sql_data: Any) -> Dict[str, str]:
     else:
         db_result_json = str(sql_data) if sql_data is not None else "{}"
 
-    prompt = f"""
+    sys_prompt = """
 INSTRUCTIONS:
 - Convert raw database results into a short, friendly, human-readable answer.
 - You may use BOTH: (1) the user question and (2) the DB result JSON to form the answer.
 - Use ONLY values present in the JSON. NEVER invent numbers or fields.
 - Keep the answer brief (1–6 lines).
 - If the question asks for last/top/highest/total, interpret based strictly on the JSON rows.
-
-QUESTION:
-{qstn}
-
-DATABASE_RESULT_JSON:
-{db_result_json}
-
 OUTPUT:
 Write a clear final answer for the user based strictly on the JSON above.
 """
-    output = call_model(prompt=prompt)
+    user_prompt=f"""
+            QUESTION:
+            {qstn}
+
+            DATABASE_RESULT_JSON:
+            {db_result_json}
+    """
+    output = call_model(user_prompt,"llm",sys_prompt)
     answer = str(output)
     return {"answer": answer}
 
@@ -1924,8 +2371,12 @@ def debug_entity_retriever(q: str):
     }
 
 
-def _invoke_pipeline(user_question: str, chat_id: str):
-    initial_state: SQLState = {"question": user_question or "", "session_id": chat_id}
+def _invoke_pipeline(user_question: str, chat_id: str, request_id: str):
+    initial_state: SQLState = {
+        "question": user_question or "",
+        "session_id": chat_id,
+        "request_id": request_id,
+    }
     config = {
         "configurable": {"thread_id": chat_id},
         "run_name": "changai_text2sql_graph",
@@ -1936,8 +2387,8 @@ def _invoke_pipeline(user_question: str, chat_id: str):
     try:
         return app.invoke(initial_state, config=config), None
     except frappe.exceptions.ValidationError as e:
-        clean_msg = re.sub(r'<[^>]+>', '', str(e))
-        return None, {"Bot": clean_msg, "error": clean_msg}
+        # clean_msg = re.sub(r'<[^>]+>', '', str(e))
+        return None, {"Bot": str(e), "error": str(e)}
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "ChangAI Pipeline Invoke Error")
         return None, {"Bot": "⚠️ An unexpected error occurred. Please try again.", "error": str(e)}
@@ -1992,20 +2443,31 @@ def _get_sql_error_message(err: Any, val: Dict) -> str:
     return f"⚠️ The model generated an invalid query. {error_text}"
 
 
-def _handle_sql_result(final: SQLState, sql: str, orm: str, formatted_q: str, fields: str,
+def _handle_sql_result(sql_prompt:str,final: SQLState, sql: str, orm: str, formatted_q: str, fields: str,
                        selected_tables: List, val: Dict, entity_debug: Dict,
                        user_question: str, chat_id: str) -> Dict:
     try:
+        request_id = final.get("request_id")
         extracted_tables = extract_tables_from_sql(sql)
         sql_result = execute_query(sql, extracted_tables)
+        publish_pipeline_update(
+            request_id,
+            "sql_executed",
+            "Query executed"
+        )
     except Exception as e:
         return {"ok": False, "error": f"SQL Execution Failed: {e}"}
 
     context = (final.get("context") or final.get("selected_fields") or "")[:800]
     contains_values = final.get("contains_values") or ""
     err = final.get("error")
-    formatted_result = format_data(formatted_q, sql_result)
-
+    formatted_result = format_data(user_question, sql_result)
+    publish_pipeline_update(
+    request_id,
+    "format_data_completed",
+    "Completed Formatting Result",
+    done=True
+)
     if not err:
         try:
             save_turn_2(session_id=chat_id, user_text=formatted_q, bot_text=formatted_result)
@@ -2016,6 +2478,7 @@ def _handle_sql_result(final: SQLState, sql: str, orm: str, formatted_q: str, fi
 
     return {
         "Question": user_question,
+        "Formated Question":formatted_q,
         "SQL": sql,
         "ORM": orm,
         "Tables": selected_tables,
@@ -2030,25 +2493,28 @@ def _handle_sql_result(final: SQLState, sql: str, orm: str, formatted_q: str, fi
 
 
 @frappe.whitelist(allow_guest=False)
-def run_text2sql_pipeline(user_question: str, chat_id: str) -> Dict:
-    final, err_response = _invoke_pipeline(user_question, chat_id)
+def run_text2sql_pipeline(user_question: str, chat_id: str, request_id: str) -> Dict:
+    final, err_response = _invoke_pipeline(user_question, chat_id, request_id)
     if err_response:
         return err_response
-
     entity_debug = {
         "contains_values": final.get("contains_values"),
         "entity_cards": final.get("entity_cards") or [],
     }
-
     if (final.get("query_type") or "NON_ERP") == "NON_ERP":
         return _handle_non_erp(final, user_question, chat_id)
-
     sql = clean_sql(final.get("sql")) or ""
     res=validate_sql_schema(sql)
+    publish_pipeline_update(
+        request_id,
+        "sql_validated",
+        "SQL valididation Completed"
+    )
     orm = clean_sql(final.get("orm")) or ""
     formatted_q = _safe_strip(final.get("formatted_q") or "")
     selected_tables = final.get("selected_tables") or []
     fields = _safe_strip(final.get("selected_fields") or "")
+    sql_prompt = _safe_strip(final.get("sql_prompt") or "")
     # val = final.get("validation") or {}
     err = final.get("error")
 
@@ -2069,4 +2535,89 @@ def run_text2sql_pipeline(user_question: str, chat_id: str) -> Dict:
             "Bot": _get_sql_error_message(err, res),
         }
 
-    return _handle_sql_result(final, sql, orm, formatted_q, fields,selected_tables, res, entity_debug, user_question, chat_id)
+    return _handle_sql_result(sql_prompt, final, sql, orm, formatted_q, fields, selected_tables, res, entity_debug, user_question, chat_id)
+
+
+
+# @frappe.whitelist(allow_guest=False)
+# def test(user_qstn, session_id):
+#     prompt = inject_prompt(user_qstn, session_id)
+    
+#     try:
+#         raw = call_model(prompt, "llm")
+#         standalone, contains_values = _parse_rewrite_response(raw, user_qstn)
+#         return standalone, contains_values
+#     except Exception as e:
+#         print(f"Error during model call: {e}")
+
+
+def load_on_startup():
+    global _EMBEDDER_INSTANCE, _VS_TABLE, _FULL_FIELDS_VS, _VS_MASTER, _FIELD_DOCS_CACHE, sym_spell, _GEMINI_CLIENT
+
+    # If all are already loaded, skip
+    if all([
+        _EMBEDDER_INSTANCE is not None,
+        _VS_TABLE is not None,
+        _FULL_FIELDS_VS is not None,
+        _VS_MASTER is not None,
+        _FIELD_DOCS_CACHE is not None,
+        sym_spell is not None,
+        _GEMINI_CLIENT is not None,
+    ]):
+        return 
+    try:
+        frappe.logger().error(f"ChangAI loading in PID: {os.getpid()}")
+        get_symspell()
+        get_embedding_engine()
+        get_table_vs()
+        get_full_fields_vs()
+        load_field_matrix()
+        gemini_client()
+        get_master_vs()
+        _init_keywords()
+        frappe.logger().info("ChangAI: All components loaded into memory")
+        config = ChangAIConfig.get()
+        get_polly_client(config)
+    except Exception as e:
+        frappe.logger().error(f"ChangAI startup load failed: {e}")
+
+
+def _init_keywords():
+    global _KEYWORDS_SET, _KEYWORDS_LIST
+    if not _KEYWORDS_SET:
+        _KEYWORDS_SET = set(kw.lower() for kw in BUSINESS_KEYWORDS)
+        _KEYWORDS_LIST = list(_KEYWORDS_SET)
+        
+        # ✅ pre-warm cache — run every keyword through _word_is_erp at startup
+        for kw in _KEYWORDS_LIST:
+            _word_is_erp(kw)  # result gets cached — first real request is instant
+
+
+@lru_cache(maxsize=None)
+def _word_is_erp(word: str) -> tuple[bool, str]:
+    """Returns (is_erp, matched_keyword)"""
+    if len(word) <= 3:
+        return False
+
+    # 1. exact
+    if word in _KEYWORDS_SET:
+        return True
+
+    # 2. substring
+    for kw in _KEYWORDS_SET:
+        if word in kw or kw in word:
+            return True
+
+    # 3. fuzzy
+    if len(word) >= 4:
+        match = process.extractOne(
+            word,
+            _KEYWORDS_LIST,
+            scorer=fuzz.ratio,
+            score_cutoff=85
+        )
+        if match:
+            return True
+
+    return False, ""
+

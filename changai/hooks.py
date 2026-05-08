@@ -44,9 +44,13 @@ ASSET_VERSION = f"?v={app_version}-{asset_build_stamp}"
 # Include JS globally on all pages
 app_include_js = [
     f"/assets/changai/dist/changai-chatbot.js{ASSET_VERSION}",
-    "/assets/changai/js/ai_translate.js"
+    "/assets/changai/js/ai_translate.js",
+    "/assets/changai/js/tooltip.js"
 ]
-app_include_css = [f"/assets/changai/dist/changai-chatbot.css{ASSET_VERSION}"]
+app_include_css = [
+    f"/assets/changai/dist/changai-chatbot.css{ASSET_VERSION}",
+    "/assets/changai/css/tooltip.css"
+]
 # In hooks.py
 # app_include_css = [
 #     "https://unpkg.com/leaflet.locatecontrol/dist/L.Control.Locate.min.css"
@@ -111,7 +115,8 @@ app_include_css = [f"/assets/changai/dist/changai-chatbot.css{ASSET_VERSION}"]
 # Installation
 # ------------
 
-# before_install = "changai.install.before_install"
+# before_install = "changai.setup.install.install_system_deps"
+
 # after_install = "changai.changai.api.v2.install.after_install"
 # after_migrate = "changai.changai.api.v2.install.after_migrate"
 # Uninstallation
@@ -124,7 +129,6 @@ app_include_css = [f"/assets/changai/dist/changai-chatbot.css{ASSET_VERSION}"]
 # ------------------
 # To set up dependencies/integrations with other apps
 # Name of the app being installed is passed as an argument
-
 # before_app_install = "changai.utils.before_app_install"
 # after_app_install = "changai.utils.after_app_install"
 
@@ -177,7 +181,16 @@ doc_events = {
 # 		"on_trash": "method"
 # 	}
 }
+on_boot = [
+    "changai.changai.api.v2.text2sql_pipeline_v2.load_on_startup",
+    "changai.changai.api.v2.schema_utils.reload_mapping_schema_cache"
+]
 
+# also runs after bench migrate
+after_migrate = [
+    "changai.changai.api.v2.text2sql_pipeline_v2.load_on_startup",
+    "changai.changai.api.v2.schema_utils.reload_mapping_schema_cache"
+]
 # Scheduled Tasks
 # ---------------
 
