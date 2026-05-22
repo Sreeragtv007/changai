@@ -17,7 +17,8 @@ _PHONETIC_BUCKETS = defaultdict(list)
 import jellyfish
 from rapidfuzz import fuzz, process
 _VALUE_TO_FIELD = {} 
-@frappe.whitelist(allow_guest=True)
+
+
 def phonetic_bucket():
     global _PHONETIC_BUCKETS, _VALUE_TO_FIELD
     from changai.changai.api.v2.auto_gen_api import _read_filedoctype
@@ -361,9 +362,3 @@ def convert_yaml_schema_to_sqlglot_meta() -> dict:
             "ok": False,
             "message": str(e)
         }
-    
-@frappe.whitelist(allow_guest=False)
-def test():
-        res=check_file_updates("master_data.yaml")
-        if not res.get("is_stale"):
-            frappe.throw(_("Please update master data for entity recognition to work. Click on Update Master Data button in Training tab in ChangAI Settings.<br>Check Quick Start Guide Here 👇"))

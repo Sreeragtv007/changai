@@ -1750,7 +1750,7 @@ def local_entity_embedder(q: str) -> List[Dict[str, Any]]:
             out.append({"entity_type": entity_type, "entity_id": entity_id, "entity_label": entity_label})
     return out
 
-@frappe.whitelist(allow_guest=True)
+
 def call_entity_retriever(qstn: str,state:Dict) -> Dict[str, Any]:
     config = ChangAIConfig.get()
     if config["REMOTE"] and config["llm"] == "QWEN3":
@@ -3003,43 +3003,11 @@ def get_embedding_engine_test():
     }
 
 
-
-@frappe.whitelist(allow_guest=True)
-def test_rewrite_question(question: str, session_id: str = "test_session"):
-    """
-    Test endpoint for rewrite_question
-    Call from Postman:
-    POST /api/method/changai.changai.api.v2.text2sql_pipeline_v2.test_rewrite_question
-    Body: { "question": "show sales for Amrin Yousuf", "session_id": "test_session" }
-    """
-    sys_prompt = SQL_REWRITE_SYS_PROMPT
-    prompt = inject_prompt(question, session_id)
-
-    try:
-        raw = call_model(prompt, "llm", sys_prompt)
-        standalone, contains_values, entity_words = _parse_rewrite_response(raw, question)
-
-        return {
-            "ok": True,
-            "raw_response":     raw,               # what LLM returned
-            "standalone":       standalone,         # rewritten question
-            "contains_values":  contains_values,    # True/False
-            "entity_words":     entity_words,       # extracted entity words
-            "prompt":           prompt              # full prompt sent to LLM
-        }
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-    
-
 _NON_ERP_DATA = None
 _NON_ERP_QUESTIONS = None
 _NON_ERP_RESPONSE_MAP = None
 
-@frappe.whitelist(allow_guest=True)
+
 def load_non_erp_data():
     global _NON_ERP_DATA, _NON_ERP_QUESTIONS, _NON_ERP_RESPONSE_MAP
 
@@ -3065,7 +3033,6 @@ def load_non_erp_data():
     return _NON_ERP_QUESTIONS, _NON_ERP_RESPONSE_MAP
 
 
-@frappe.whitelist(allow_guest=True)
 def non_erp_response(non_erp_q: str) -> Optional[str]:
     questions, response_map = load_non_erp_data()
     result = process.extractOne(

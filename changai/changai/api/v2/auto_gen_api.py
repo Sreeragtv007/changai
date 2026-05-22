@@ -63,7 +63,8 @@ def ensure_file_folder(folder_path: str, is_private: int = 1) -> str:
         current_path = next_path
 
     return current_path
-@frappe.whitelist(allow_guest=False)
+
+
 def get_mod(app_names: list[str]):
     if isinstance(app_names, str):
         app_names = frappe.parse_json(app_names)
@@ -332,7 +333,7 @@ def _clean_schema_fields(by_table: Dict[str, Dict[str, Any]]) -> None:
                 field.pop("join_hint", None)
 
 
-@frappe.whitelist(allow_guest=False)
+
 def get_doctypes_changed_since(last_sync: Optional[str]) -> List[str]:
     app_names=["erpnext","frappe"]
     erpnext_modules = get_mod(app_names)
