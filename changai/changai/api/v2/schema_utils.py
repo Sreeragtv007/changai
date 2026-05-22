@@ -33,7 +33,7 @@ def phonetic_bucket():
         _PHONETIC_BUCKETS[key].append(value)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=False)
 def phonetic_match(word:str, threshold: int=65):
     global _PHONETIC_BUCKETS, _VALUE_TO_FIELD
     candidates = []
